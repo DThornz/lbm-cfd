@@ -4,7 +4,7 @@
 
 Part of the [A. Mirza academic tools portfolio](https://dthornz.github.io/website-cv-tools/).
 
-🌐 **Live:** [dthornz.github.io/lbm-cfd](https://dthornz.github.io/lbm-cfd/)
+**Live:** [dthornz.github.io/lbm-cfd](https://dthornz.github.io/lbm-cfd/)
 
 ---
 
