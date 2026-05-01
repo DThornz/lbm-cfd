@@ -1134,6 +1134,7 @@ function decodeRB3(buf, off) {
 
 // Run the probe aggregation shader on the GPU and read back 6 RGBA8 pixels.
 // Returns an object {ux, uy, dRho, wallSpd, nFluid, nWall} in lattice units.
+let _probeDbg = true;
 function sampleProbeGPU(cx, cy) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbeRB);
   gl.viewport(0, 0, 6, 1);
@@ -1147,6 +1148,13 @@ function sampleProbeGPU(cx, cy) {
   gl.uniform1f(uProbeRead.uRadius, probe.radiusCells);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
   gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+  if (_probeDbg) {
+    _probeDbg = false;
+    const fbSt = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    console.log('[probe-dbg] cx=' + cx + ' cy=' + cy
+      + ' fboStatus=' + fbSt
+      + ' raw=' + Array.from(probeRBuf).join(','));
+  }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   const U = 0.25, D = 0.15;
