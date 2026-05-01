@@ -1138,6 +1138,7 @@ let _probeDbg = true;
 function sampleProbeGPU(cx, cy) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbeRB);
   gl.viewport(0, 0, 6, 1);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);  // explicitly ensure draw target
   bindQuad(progProbeRead);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
@@ -1146,14 +1147,31 @@ function sampleProbeGPU(cx, cy) {
   gl.uniform1f(uProbeRead.uCX,     cx);
   gl.uniform1f(uProbeRead.uCY,     cy);
   gl.uniform1f(uProbeRead.uRadius, probe.radiusCells);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+
   if (_probeDbg) {
+    // Step 1: clear to magenta, read back — verifies FBO readPixels works.
+    gl.clearColor(1.0, 0.0, 1.0, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+    const afterClear = Array.from(probeRBuf.slice(0, 4));
+    gl.clearColor(0, 0, 0, 0);
+    // Step 2: draw shader, read back.
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    const errAfterDraw = gl.getError();
+    gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
     _probeDbg = false;
-    const fbSt = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    console.log('[probe-dbg] cx=' + cx + ' cy=' + cy
-      + ' fboStatus=' + fbSt
-      + ' raw=' + Array.from(probeRBuf).join(','));
+    const loc = gl.getAttribLocation(progProbeRead, 'aP');
+    console.log('[probe-dbg2]'
+      + ' afterClear(px0)=' + afterClear
+      + ' drawErr=' + errAfterDraw
+      + ' afterDraw(px0,4,5)=' + Array.from(probeRBuf.slice(0,4))
+      + '|' + Array.from(probeRBuf.slice(16,20))
+      + '|' + Array.from(probeRBuf.slice(20,24))
+      + ' aPLoc=' + loc
+      + ' cx=' + cx + ' cy=' + cy);
+  } else {
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
