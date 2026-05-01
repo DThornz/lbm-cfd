@@ -26,9 +26,9 @@ const probeGraphCtx = probeGraphCv.getContext('2d');
 
 const probe = {
   enabled: false,
-  nx: 0.30,        // normalized canvas X [0,1] (CSS convention, left→right)
+  nx: 0.10,        // normalized canvas X [0,1] (CSS convention, left→right)
   ny: 0.50,        // normalized canvas Y [0,1] (CSS convention, top→bottom)
-  radiusCells: 10,
+  radiusCells: 5,
   mode: 'fluid',   // 'fluid' | 'wall'
   history: [],     // {step, value, secondary} ring buffer
   maxHistory: 500,
@@ -1286,22 +1286,14 @@ function updateStats() {
 }
 
 /* ---------- Probe ---------- */
+// Samples from macroReadBuf (CPU-side). Caller must ensure macroReadBuf is fresh.
+let probeReadCounter = 0;
 function readProbeData() {
-  // Lattice cell at probe center (flip Y: CSS top=0, lattice bottom=0)
+  if (!macroReadBuf || macroReadBuf.length < NX * NY * 4) return;
+
   const cx = Math.round(probe.nx * (NX - 1));
   const cy = Math.round((1.0 - probe.ny) * (NY - 1));
   const r  = probe.radiusCells;
-
-  const x0 = Math.max(0, cx - r), y0 = Math.max(0, cy - r);
-  const x1 = Math.min(NX - 1, cx + r), y1 = Math.min(NY - 1, cy + r);
-  const pw = x1 - x0 + 1, ph = y1 - y0 + 1;
-
-  const needed = pw * ph * 4;
-  if (!probe.readBuf || probe.readBuf.length !== needed) probe.readBuf = new Float32Array(needed);
-
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
-  gl.readPixels(x0, y0, pw, ph, gl.RGBA, gl.FLOAT, probe.readBuf);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   const centerCt = (cx >= 0 && cx < NX && cy >= 0 && cy < NY) ? geomData[(cy * NX + cx) * 4] : 1;
 
@@ -1314,45 +1306,40 @@ function readProbeData() {
       const ci = cx + dx, cj = cy + dy;
       if (ci < 0 || ci >= NX || cj < 0 || cj >= NY) continue;
       const ct = geomData[(cj * NX + ci) * 4];
-      if (ct > 0.5) continue; // not fluid
+      if (ct > 0.5) continue;
 
-      const bx = ci - x0, by = cj - y0;
-      const bi = (by * pw + bx) * 4;
-      const ux = probe.readBuf[bi], uy = probe.readBuf[bi + 1], rho = probe.readBuf[bi + 2];
-
+      const bi  = (cj * NX + ci) * 4;
+      const ux  = macroReadBuf[bi], uy = macroReadBuf[bi + 1], rho = macroReadBuf[bi + 2];
       const spd = Math.sqrt(ux * ux + uy * uy) * state.uScale;
       sumVel  += spd;
       sumPres += (rho - 1.0) * state.pScale;
       cntFluid++;
 
-      // WSS: fluid cell adjacent to a wall → half-way bounce-back: WSS = 2μ|u|/DX
       const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
-      let wallAdj = false;
       for (const [ddx, ddy] of dirs) {
         const ni = ci + ddx, nj = cj + ddy;
         if (ni < 0 || ni >= NX || nj < 0 || nj >= NY) continue;
         const nct = geomData[(nj * NX + ni) * 4];
-        if (nct > 0.5 && nct < 1.5) { wallAdj = true; break; }
-      }
-      if (wallAdj) {
-        sumWSS += 2.0 * state.muN * spd / DX;
-        cntWall++;
+        if (nct > 0.5 && nct < 1.5) {
+          sumWSS += 2.0 * state.muN * spd / DX;
+          cntWall++;
+          break;
+        }
       }
     }
   }
 
-  // Mode: wall if center is a wall cell, or if ≥1/3 of fluid cells touch a wall
   probe.mode = (centerCt > 0.5 && centerCt < 1.5) || (cntWall > 0 && cntFluid > 0 && cntWall >= cntFluid / 3)
     ? 'wall' : 'fluid';
 
   let value, secondary;
   if (probe.mode === 'wall' && cntWall > 0) {
-    value     = sumWSS / cntWall;
+    value = sumWSS / cntWall;
     secondary = cntFluid > 0 ? sumVel / cntFluid : 0;
   } else if (cntFluid > 0) {
     probe.mode = 'fluid';
-    value      = sumVel  / cntFluid;
-    secondary  = sumPres / cntFluid;
+    value     = sumVel  / cntFluid;
+    secondary = sumPres / cntFluid;
   } else {
     return;
   }
@@ -1360,7 +1347,6 @@ function readProbeData() {
   probe.history.push({ step: stepN, value, secondary, mode: probe.mode });
   if (probe.history.length > probe.maxHistory) probe.history.shift();
 
-  // Update header labels
   const modeEl = $('probeModeLabel');
   const valEl  = $('probeValLabel');
   if (probe.mode === 'wall') {
@@ -1548,12 +1534,22 @@ function frame(time) {
     if (state.showStream)    advanceStream();
   }
 
+  // Probe readback must happen before renderToCanvas binds texMacro as a sampler.
+  // Throttled to every 8 frames (~7 Hz at 60 fps) to avoid constant GPU stalls.
+  if (probe.enabled) {
+    probeReadCounter++;
+    if (probeReadCounter >= 8) {
+      probeReadCounter = 0;
+      readMacroField();   // GPU→CPU: updates macroReadBuf
+      readProbeData();    // pure JS: samples from macroReadBuf
+    }
+  }
+
   renderToCanvas(time);
   if (state.showParticles) renderParticles();
   drawColorbar();
 
   if (probe.enabled) {
-    readProbeData();
     drawProbeOverlay();
     drawProbeGraph();
   }
