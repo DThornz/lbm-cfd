@@ -124,6 +124,7 @@
       <label class="chk"><input type="checkbox" id="chkPa"> Tracer particles</label>
       <label class="chk"><input type="checkbox" id="chkGr" checked> Gravity (−y)</label>
       <label class="chk"><input type="checkbox" id="chkSS"> Auto-stop at steady state</label>
+      <label class="chk"><input type="checkbox" id="chkProbe"> WSS / flow probe</label>
     </div>
   </div>
   <div class="csep"></div>
@@ -278,7 +279,10 @@
       <span class="stt">ΔKE: <span id="sRes">—</span></span>
     </div>
   </div>
-  <canvas id="cfdCanvas" width="900" height="360"></canvas>
+  <div class="canvas-wrap">
+    <canvas id="cfdCanvas" width="900" height="360"></canvas>
+    <canvas id="probeOverlay" width="900" height="360"></canvas>
+  </div>
   <div class="sim-bot">
     <div class="cb-wrap">
       <span class="cb-val" id="cbLo">0</span>
@@ -292,6 +296,17 @@
 </div>
 
 <div class="brush-ind" id="bInd"></div>
+
+<div id="probeSection" class="probe-section" style="display:none">
+  <div class="probe-hdr">
+    <div style="display:flex;align-items:center;gap:12px">
+      <span id="probeModeLabel" class="probe-mode-lbl">● Probe</span>
+      <span id="probeValLabel" class="probe-val-lbl">drag probe onto vessel</span>
+    </div>
+    <span style="font-size:.72em;color:#475569">last <span id="probeHistLen">0</span> samples · probe radius: 10 cells</span>
+  </div>
+  <canvas id="probeGraph" height="160" style="display:block;width:100%"></canvas>
+</div>
 
 <div class="quickstart">
   <div class="qs-title">Quick Start Guide</div>

@@ -18,6 +18,24 @@ const canvas = $('cfdCanvas');
 const cbCv = $('cbCanvas');
 const cbCtx = cbCv.getContext('2d');
 
+/* ---------- Probe ---------- */
+const probeOverlayCv = $('probeOverlay');
+const probeOverlayCtx = probeOverlayCv.getContext('2d');
+const probeGraphCv = $('probeGraph');
+const probeGraphCtx = probeGraphCv.getContext('2d');
+
+const probe = {
+  enabled: false,
+  nx: 0.30,        // normalized canvas X [0,1] (CSS convention, left→right)
+  ny: 0.50,        // normalized canvas Y [0,1] (CSS convention, top→bottom)
+  radiusCells: 10,
+  mode: 'fluid',   // 'fluid' | 'wall'
+  history: [],     // {step, value, secondary} ring buffer
+  maxHistory: 500,
+  readBuf: null,
+  dragging: false,
+};
+
 /* ---------- WebGL2 context ---------- */
 const gl = canvas.getContext('webgl2', { alpha: false, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: false });
 if (!gl) { showErr('WebGL2 is not supported in this browser.'); return; }
@@ -1267,6 +1285,247 @@ function updateStats() {
   $('pInClampHint').style.display = pInClamped ? 'inline' : 'none';
 }
 
+/* ---------- Probe ---------- */
+function readProbeData() {
+  // Lattice cell at probe center (flip Y: CSS top=0, lattice bottom=0)
+  const cx = Math.round(probe.nx * (NX - 1));
+  const cy = Math.round((1.0 - probe.ny) * (NY - 1));
+  const r  = probe.radiusCells;
+
+  const x0 = Math.max(0, cx - r), y0 = Math.max(0, cy - r);
+  const x1 = Math.min(NX - 1, cx + r), y1 = Math.min(NY - 1, cy + r);
+  const pw = x1 - x0 + 1, ph = y1 - y0 + 1;
+
+  const needed = pw * ph * 4;
+  if (!probe.readBuf || probe.readBuf.length !== needed) probe.readBuf = new Float32Array(needed);
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
+  gl.readPixels(x0, y0, pw, ph, gl.RGBA, gl.FLOAT, probe.readBuf);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  const centerCt = (cx >= 0 && cx < NX && cy >= 0 && cy < NY) ? geomData[(cy * NX + cx) * 4] : 1;
+
+  let sumVel = 0, sumPres = 0, cntFluid = 0;
+  let sumWSS = 0, cntWall = 0;
+
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx * dx + dy * dy > r * r) continue;
+      const ci = cx + dx, cj = cy + dy;
+      if (ci < 0 || ci >= NX || cj < 0 || cj >= NY) continue;
+      const ct = geomData[(cj * NX + ci) * 4];
+      if (ct > 0.5) continue; // not fluid
+
+      const bx = ci - x0, by = cj - y0;
+      const bi = (by * pw + bx) * 4;
+      const ux = probe.readBuf[bi], uy = probe.readBuf[bi + 1], rho = probe.readBuf[bi + 2];
+
+      const spd = Math.sqrt(ux * ux + uy * uy) * state.uScale;
+      sumVel  += spd;
+      sumPres += (rho - 1.0) * state.pScale;
+      cntFluid++;
+
+      // WSS: fluid cell adjacent to a wall → half-way bounce-back: WSS = 2μ|u|/DX
+      const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+      let wallAdj = false;
+      for (const [ddx, ddy] of dirs) {
+        const ni = ci + ddx, nj = cj + ddy;
+        if (ni < 0 || ni >= NX || nj < 0 || nj >= NY) continue;
+        const nct = geomData[(nj * NX + ni) * 4];
+        if (nct > 0.5 && nct < 1.5) { wallAdj = true; break; }
+      }
+      if (wallAdj) {
+        sumWSS += 2.0 * state.muN * spd / DX;
+        cntWall++;
+      }
+    }
+  }
+
+  // Mode: wall if center is a wall cell, or if ≥1/3 of fluid cells touch a wall
+  probe.mode = (centerCt > 0.5 && centerCt < 1.5) || (cntWall > 0 && cntFluid > 0 && cntWall >= cntFluid / 3)
+    ? 'wall' : 'fluid';
+
+  let value, secondary;
+  if (probe.mode === 'wall' && cntWall > 0) {
+    value     = sumWSS / cntWall;
+    secondary = cntFluid > 0 ? sumVel / cntFluid : 0;
+  } else if (cntFluid > 0) {
+    probe.mode = 'fluid';
+    value      = sumVel  / cntFluid;
+    secondary  = sumPres / cntFluid;
+  } else {
+    return;
+  }
+
+  probe.history.push({ step: stepN, value, secondary, mode: probe.mode });
+  if (probe.history.length > probe.maxHistory) probe.history.shift();
+
+  // Update header labels
+  const modeEl = $('probeModeLabel');
+  const valEl  = $('probeValLabel');
+  if (probe.mode === 'wall') {
+    modeEl.textContent = '● WSS probe';
+    modeEl.className = 'probe-mode-lbl wall';
+    valEl.textContent = `WSS ${value.toFixed(2)} Pa   |U|near ${secondary.toFixed(3)} m/s`;
+  } else {
+    modeEl.textContent = '● Fluid probe';
+    modeEl.className = 'probe-mode-lbl';
+    valEl.textContent = `|U| ${value.toFixed(3)} m/s   P ${secondary.toFixed(1)} Pa`;
+  }
+  $('probeHistLen').textContent = probe.history.length;
+}
+
+function drawProbeOverlay() {
+  const ow = probeOverlayCv.width, oh = probeOverlayCv.height;
+  probeOverlayCtx.clearRect(0, 0, ow, oh);
+  if (!probe.enabled) return;
+
+  const px   = probe.nx * ow;
+  const py   = probe.ny * oh;
+  const rPx  = probe.radiusCells * (ow / NX);
+  const isWall = probe.mode === 'wall';
+  const col    = isWall ? 'rgba(245,158,11,0.18)' : 'rgba(13,148,136,0.18)';
+  const stroke = isWall ? '#f59e0b' : '#0d9488';
+
+  probeOverlayCtx.beginPath();
+  probeOverlayCtx.arc(px, py, rPx, 0, Math.PI * 2);
+  probeOverlayCtx.fillStyle = col;
+  probeOverlayCtx.fill();
+  probeOverlayCtx.strokeStyle = stroke;
+  probeOverlayCtx.lineWidth = 1.5;
+  probeOverlayCtx.setLineDash([4, 3]);
+  probeOverlayCtx.stroke();
+  probeOverlayCtx.setLineDash([]);
+
+  const ch = 6;
+  probeOverlayCtx.strokeStyle = stroke;
+  probeOverlayCtx.lineWidth = 1;
+  probeOverlayCtx.beginPath();
+  probeOverlayCtx.moveTo(px - ch, py); probeOverlayCtx.lineTo(px + ch, py);
+  probeOverlayCtx.moveTo(px, py - ch); probeOverlayCtx.lineTo(px, py + ch);
+  probeOverlayCtx.stroke();
+
+  probeOverlayCtx.font = 'bold 10px monospace';
+  probeOverlayCtx.fillStyle = stroke;
+  probeOverlayCtx.textAlign = 'center';
+  probeOverlayCtx.fillText(isWall ? 'WSS' : '|U|', px, py - rPx - 4);
+}
+
+function drawProbeGraph() {
+  const gw = probeGraphCv.clientWidth || 900;
+  const gh = 160;
+  probeGraphCv.width  = gw;
+  probeGraphCv.height = gh;
+  const ctx = probeGraphCtx;
+
+  ctx.fillStyle = '#000916';
+  ctx.fillRect(0, 0, gw, gh);
+
+  const h = probe.history;
+  if (h.length < 2) {
+    ctx.fillStyle = '#475569';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Move probe into the vessel…', gw / 2, gh / 2);
+    return;
+  }
+
+  const pad = { l: 64, r: 18, t: 14, b: 28 };
+  const pw  = gw - pad.l - pad.r;
+  const ph  = gh - pad.t - pad.b;
+
+  const isWall   = h[h.length - 1].mode === 'wall';
+  const lineCol  = isWall ? '#f59e0b' : '#0d9488';
+  const secCol   = isWall ? '#94a3b8' : '#38bdf8';
+  const unit     = isWall ? 'WSS (Pa)' : '|U| (m/s)';
+  const secUnit  = isWall ? '|U| (m/s)' : 'P (Pa)';
+
+  const vals = h.map(d => d.value).filter(isFinite);
+  let yMin = Math.min(...vals), yMax = Math.max(...vals);
+  const span = yMax - yMin;
+  if (span < 1e-9) { yMin -= 0.01; yMax += 0.01; }
+  else { yMin -= span * 0.08; yMax += span * 0.15; }
+
+  // Grid lines
+  ctx.strokeStyle = '#1e293b';
+  ctx.lineWidth = 1;
+  const nY = 4;
+  for (let i = 0; i <= nY; i++) {
+    const yy = pad.t + ph - (i / nY) * ph;
+    ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(pad.l + pw, yy); ctx.stroke();
+    const v = yMin + (i / nY) * (yMax - yMin);
+    ctx.fillStyle = '#475569';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.abs(v) < 0.001 ? v.toExponential(1) : v.toFixed(3), pad.l - 4, yy + 3);
+  }
+
+  // Axes
+  ctx.strokeStyle = '#334155';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + ph); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t + ph); ctx.lineTo(pad.l + pw, pad.t + ph); ctx.stroke();
+
+  // Secondary line (lighter, behind)
+  const secVals = h.map(d => d.secondary).filter(isFinite);
+  if (secVals.length > 1) {
+    let sMin = Math.min(...secVals), sMax = Math.max(...secVals);
+    const ss = sMax - sMin;
+    if (ss < 1e-9) { sMin -= 0.01; sMax += 0.01; }
+    ctx.beginPath();
+    ctx.strokeStyle = secCol;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 1;
+    for (let i = 0; i < h.length; i++) {
+      const x = pad.l + (i / (probe.maxHistory - 1)) * pw;
+      const y = pad.t + ph - ((h[i].secondary - sMin) / (sMax - sMin)) * ph;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1.0;
+    // secondary legend
+    ctx.fillStyle = secCol;
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(secUnit, gw - pad.r, pad.t + 10);
+  }
+
+  // Primary line
+  ctx.beginPath();
+  ctx.strokeStyle = lineCol;
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < h.length; i++) {
+    const x = pad.l + (i / (probe.maxHistory - 1)) * pw;
+    const y = pad.t + ph - ((h[i].value - yMin) / (yMax - yMin)) * ph;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Live dot at tip
+  if (h.length > 0) {
+    const last = h[h.length - 1];
+    const lx = pad.l + ((h.length - 1) / (probe.maxHistory - 1)) * pw;
+    const ly = pad.t + ph - ((last.value - yMin) / (yMax - yMin)) * ph;
+    ctx.beginPath();
+    ctx.arc(lx, ly, 3, 0, Math.PI * 2);
+    ctx.fillStyle = lineCol;
+    ctx.fill();
+  }
+
+  // Axis labels
+  ctx.fillStyle = '#475569';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('step →', pad.l + 2, pad.t + ph + 18);
+  ctx.save();
+  ctx.translate(11, pad.t + ph / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = lineCol;
+  ctx.fillText(unit, 0, 0);
+  ctx.restore();
+}
+
 /* ---------- Main Loop ---------- */
 function frame(time) {
   if (!paused) {
@@ -1292,6 +1551,12 @@ function frame(time) {
   renderToCanvas(time);
   if (state.showParticles) renderParticles();
   drawColorbar();
+
+  if (probe.enabled) {
+    readProbeData();
+    drawProbeOverlay();
+    drawProbeGraph();
+  }
 
   fpsN++;
   if (time - fpsT > 500) {
@@ -1336,7 +1601,24 @@ function applyBrush(i, j, typ) {
   forceDiagnosticsUpdate();
 }
 
+function probeCursorNorm(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    nx: (e.clientX - r.left) / r.width,
+    ny: (e.clientY - r.top)  / r.height,
+  };
+}
+function isNearProbe(nx, ny) {
+  const dx = nx - probe.nx, dy = ny - probe.ny;
+  const rNorm = probe.radiusCells / NX * 1.6; // 60% pick-up tolerance
+  return dx * dx + dy * dy < rNorm * rNorm;
+}
+
 canvas.addEventListener('mousedown', e => {
+  if (probe.enabled) {
+    const _p = probeCursorNorm(e);
+    if (isNearProbe(_p.nx, _p.ny)) { probe.dragging = true; return; }
+  }
   if (tool === 'none') return;
   drawing = true;
   isErasing = (e.button === 2) || tool === 'erase';
@@ -1344,6 +1626,14 @@ canvas.addEventListener('mousedown', e => {
   applyBrush(i, j, isErasing ? CELL_FLUID : CELL_WALL);
 });
 canvas.addEventListener('mousemove', e => {
+  if (probe.dragging) {
+    const { nx, ny } = probeCursorNorm(e);
+    probe.nx = Math.max(0, Math.min(1, nx));
+    probe.ny = Math.max(0, Math.min(1, ny));
+    probe.history = [];
+    drawProbeOverlay();
+    return;
+  }
   const r = canvas.getBoundingClientRect();
   const ind = $('bInd');
   if (tool !== 'none') {
@@ -1362,8 +1652,9 @@ canvas.addEventListener('mousemove', e => {
     applyBrush(i, j, isErasing ? CELL_FLUID : CELL_WALL);
   }
 });
-canvas.addEventListener('mouseup', () => { drawing = false; });
+canvas.addEventListener('mouseup', () => { probe.dragging = false; drawing = false; });
 canvas.addEventListener('mouseleave', () => {
+  probe.dragging = false;
   drawing = false;
   $('bInd').style.display = 'none';
 });
@@ -1457,6 +1748,12 @@ $('txtMax').addEventListener('input', e => {
   if (isFinite(v)) { state.manualMax = v; applyScaleMode(); }
 });
 $('chkGr').addEventListener('change', e => { state.gravity = e.target.checked; resetSteady(); forceDiagnosticsUpdate(); });
+$('chkProbe').addEventListener('change', e => {
+  probe.enabled = e.target.checked;
+  $('probeSection').style.display = probe.enabled ? 'block' : 'none';
+  probe.history = [];
+  if (!probe.enabled) probeOverlayCtx.clearRect(0, 0, probeOverlayCv.width, probeOverlayCv.height);
+});
 $('chkSS').addEventListener('change', e => {
   state.detectSteady = e.target.checked;
   if (!e.target.checked) resetSteady();
@@ -1541,6 +1838,7 @@ $('btnReset').addEventListener('click', () => {
   resetSteady();
   seedParticles();
   clearStream();
+  probe.history = [];
   forceDiagnosticsUpdate();
   if (paused) $('btnPlay').click();
 });
