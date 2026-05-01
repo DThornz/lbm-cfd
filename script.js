@@ -406,7 +406,7 @@ void main(){
     col = jet(normalize01(raw));
   } else if (uField < 1.5) {
     raw = (rho - 1.0) * uPScale;
-    col = jet(normalize01(raw));
+    col = rwb(normalize01(raw));
   } else {
     vec2 ts = 1.0 / uRes;
     vec4 mR = texture(uMacro, vUV + vec2( ts.x, 0.0));
@@ -1110,13 +1110,8 @@ function applyScaleMode() {
       vmin = 0;
     }
   } else if (state.field === 'pres') {
-    let mn = lo, mx = hi;
-    if (mn < 0 && mx > 0) {
-      const m = Math.max(Math.abs(mn), Math.abs(mx));
-      mn = -m; mx = m;
-    }
-    if (Math.abs(mx - mn) < 1e-6) mx = mn + 1;
-    vmin = mn; vmax = mx;
+    const m = Math.max(Math.abs(lo), Math.abs(hi), 1.0);
+    vmin = -m; vmax = m;
   } else {
     const m = Math.max(Math.abs(lo), Math.abs(hi), 1e-3);
     vmin = -m; vmax = m;
@@ -1295,7 +1290,8 @@ function readProbeData() {
   const cy = Math.round((1.0 - probe.ny) * (NY - 1));
   const r  = probe.radiusCells;
 
-  const centerCt = (cx >= 0 && cx < NX && cy >= 0 && cy < NY) ? geomData[(cy * NX + cx) * 4] : 1;
+  const centerBi = (cy * NX + cx) * 4;
+  const centerCt = (cx >= 0 && cx < NX && cy >= 0 && cy < NY) ? macroReadBuf[centerBi + 3] : 1;
 
   let sumVel = 0, sumPres = 0, cntFluid = 0;
   let sumWSS = 0, cntWall = 0;
@@ -1305,10 +1301,10 @@ function readProbeData() {
       if (dx * dx + dy * dy > r * r) continue;
       const ci = cx + dx, cj = cy + dy;
       if (ci < 0 || ci >= NX || cj < 0 || cj >= NY) continue;
-      const ct = geomData[(cj * NX + ci) * 4];
+      const bi = (cj * NX + ci) * 4;
+      const ct = macroReadBuf[bi + 3];
       if (ct > 0.5) continue;
 
-      const bi  = (cj * NX + ci) * 4;
       const ux  = macroReadBuf[bi], uy = macroReadBuf[bi + 1], rho = macroReadBuf[bi + 2];
       const spd = Math.sqrt(ux * ux + uy * uy) * state.uScale;
       sumVel  += spd;
@@ -1319,7 +1315,7 @@ function readProbeData() {
       for (const [ddx, ddy] of dirs) {
         const ni = ci + ddx, nj = cj + ddy;
         if (ni < 0 || ni >= NX || nj < 0 || nj >= NY) continue;
-        const nct = geomData[(nj * NX + ni) * 4];
+        const nct = macroReadBuf[(nj * NX + ni) * 4 + 3];
         if (nct > 0.5 && nct < 1.5) {
           sumWSS += 2.0 * state.muN * spd / DX;
           cntWall++;
