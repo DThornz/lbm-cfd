@@ -6,8 +6,8 @@ console.log('WebGL2 supported:', !!document.createElement('canvas').getContext('
 /* ---------- Physical constants ---------- */
 const RHO_BLOOD = 1060.0;
 const L_PHYS = 0.01;
-const U_LAT_MIN = 0.02;
-const U_LAT_MAX = 0.04;
+const U_LAT_MIN = 0.04;
+const U_LAT_MAX = 0.10;
 
 const CELL_FLUID = 0, CELL_WALL = 1, CELL_INLET = 2, CELL_OUTLET = 3;
 const CY_MU0 = 56e-3, CY_MUI = 3.45e-3, CY_LAM = 3.313, CY_N = 0.3568, CY_A = 2.0;
@@ -116,7 +116,12 @@ const float W0=4.0/9.0, W14=1.0/9.0, W58=1.0/36.0;
 void main(){
   float ct = texture(uGeom, vUV).r;
   float u = 0.0, v = 0.0, rho = 1.0;
-  if (ct > 1.5 && ct < 2.5) u = uUlat;
+  if (ct > 1.5 && ct < 2.5) {
+    u = uUlat;
+  } else if (ct < 0.5) {
+    u = uUlat;
+    v = 0.025 * uUlat * sin(vUV.x * 18.8496) * (vUV.y - 0.5);
+  }
   float usq = 1.5*(u*u + v*v);
   float cu;
   float f[9];
@@ -188,8 +193,8 @@ void main(){
   rho = clamp(rho, 0.1, 5.0);
   float ux = (f1 - f3 + f5 - f6 - f7 + f8) / rho;
   float uy = (f2 - f4 + f5 + f6 - f7 - f8) / rho;
-  ux = clamp(ux, -0.10, 0.10);
-  uy = clamp(uy, -0.10, 0.10);
+  ux = clamp(ux, -0.20, 0.20);
+  uy = clamp(uy, -0.20, 0.20);
 
   if (ct > 1.5 && ct < 2.5) {
     if (uInletType == 0) {
@@ -203,7 +208,7 @@ void main(){
           u_local = 1.2 * uUlat * max(0.0, 1.0 - t * t);
         }
       }
-      ux = clamp(u_local, -0.10, 0.10);
+      ux = clamp(u_local, -0.20, 0.20);
       uy = 0.0;
       rho = 1.0;
     } else {
@@ -214,7 +219,7 @@ void main(){
             n3=SANE(nA.a,1.0/9.0), n4=SANE(nB.r,1.0/9.0), n5=SANE(nB.g,1.0/36.0),
             n6=SANE(nB.b,1.0/36.0), n7=SANE(nB.a,1.0/36.0), n8=SANE(nC.r,1.0/36.0);
       float nrho = clamp(n0+n1+n2+n3+n4+n5+n6+n7+n8, 0.1, 5.0);
-      ux = clamp((n1 - n3 + n5 - n6 - n7 + n8) / nrho, -0.10, 0.10);
+      ux = clamp((n1 - n3 + n5 - n6 - n7 + n8) / nrho, -0.20, 0.20);
       uy = 0.0;
     }
   } else if (ct > 2.5 && ct < 3.5) {
@@ -226,8 +231,8 @@ void main(){
       f6 = SANE(nB.b, 1.0/36.0);
       f7 = SANE(nB.a, 1.0/36.0);
       rho = clamp(f0+f1+f2+f3+f4+f5+f6+f7+f8, 0.1, 5.0);
-      ux = clamp((f1 - f3 + f5 - f6 - f7 + f8) / rho, -0.10, 0.10);
-      uy = clamp((f2 - f4 + f5 + f6 - f7 - f8) / rho, -0.10, 0.10);
+      ux = clamp((f1 - f3 + f5 - f6 - f7 + f8) / rho, -0.20, 0.20);
+      uy = clamp((f2 - f4 + f5 + f6 - f7 - f8) / rho, -0.20, 0.20);
     } else {
       rho = clamp(uRhoOut, 0.5, 2.0);
       ivec2 up = clm(coord - ivec2(1, 0));
@@ -236,13 +241,13 @@ void main(){
             n3=SANE(nA.a,1.0/9.0), n4=SANE(nB.r,1.0/9.0), n5=SANE(nB.g,1.0/36.0),
             n6=SANE(nB.b,1.0/36.0), n7=SANE(nB.a,1.0/36.0), n8=SANE(nC.r,1.0/36.0);
       float nrho = clamp(n0+n1+n2+n3+n4+n5+n6+n7+n8, 0.1, 5.0);
-      ux = clamp((n1 - n3 + n5 - n6 - n7 + n8) / nrho, -0.10, 0.10);
-      uy = clamp((n2 - n4 + n5 + n6 - n7 - n8) / nrho, -0.10, 0.10);
+      ux = clamp((n1 - n3 + n5 - n6 - n7 + n8) / nrho, -0.20, 0.20);
+      uy = clamp((n2 - n4 + n5 + n6 - n7 - n8) / nrho, -0.20, 0.20);
     }
   }
 
-  float uxE = clamp(ux + uGx, -0.10, 0.10);
-  float uyE = clamp(uy + uGy, -0.10, 0.10);
+  float uxE = clamp(ux + uGx, -0.20, 0.20);
+  float uyE = clamp(uy + uGy, -0.20, 0.20);
 
   float tauL = uTau;
   if (uNonNewt == 1) {
