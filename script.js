@@ -1892,7 +1892,6 @@ $('chkProbe').addEventListener('change', e => {
   probe.enabled = e.target.checked;
   $('probeSection').style.display = probe.enabled ? 'block' : 'none';
   probe.history = [];
-  probeDebugOnce = true;
   probeReadCounter = 0;
   if (!probe.enabled) probeOverlayCtx.clearRect(0, 0, probeOverlayCv.width, probeOverlayCv.height);
 });
