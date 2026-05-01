@@ -1283,6 +1283,7 @@ function updateStats() {
 /* ---------- Probe ---------- */
 // Samples from macroReadBuf (CPU-side). Caller must ensure macroReadBuf is fresh.
 let probeReadCounter = 0;
+let probeDebugOnce = true;
 function readProbeData() {
   if (!macroReadBuf || macroReadBuf.length < NX * NY * 4) return;
 
@@ -1290,8 +1291,21 @@ function readProbeData() {
   const cy = Math.round((1.0 - probe.ny) * (NY - 1));
   const r  = probe.radiusCells;
 
-  const centerBi = (cy * NX + cx) * 4;
-  const centerCt = (cx >= 0 && cx < NX && cy >= 0 && cy < NY) ? macroReadBuf[centerBi + 3] : 1;
+  // One-shot diagnostic: tells us if readPixels is actually returning data.
+  if (probeDebugOnce && cx >= 0 && cx < NX && cy >= 0 && cy < NY) {
+    probeDebugOnce = false;
+    const bi = (cy * NX + cx) * 4;
+    console.log('[probe] first read at cell (' + cx + ',' + cy + '):'
+      + ' ux=' + macroReadBuf[bi].toFixed(5)
+      + ' uy=' + macroReadBuf[bi+1].toFixed(5)
+      + ' rho=' + macroReadBuf[bi+2].toFixed(5)
+      + ' ct_mac=' + macroReadBuf[bi+3].toFixed(2)
+      + ' ct_geo=' + geomData[(cy*NX+cx)*4]);
+  }
+
+  // Use geomData for cell-type (CPU-authoritative, always fresh).
+  const centerCt = (cx >= 0 && cx < NX && cy >= 0 && cy < NY)
+    ? geomData[(cy * NX + cx) * 4] : 1;
 
   let sumVel = 0, sumPres = 0, cntFluid = 0;
   let sumWSS = 0, cntWall = 0;
@@ -1301,10 +1315,10 @@ function readProbeData() {
       if (dx * dx + dy * dy > r * r) continue;
       const ci = cx + dx, cj = cy + dy;
       if (ci < 0 || ci >= NX || cj < 0 || cj >= NY) continue;
-      const bi = (cj * NX + ci) * 4;
-      const ct = macroReadBuf[bi + 3];
+      const ct = geomData[(cj * NX + ci) * 4];
       if (ct > 0.5) continue;
 
+      const bi  = (cj * NX + ci) * 4;
       const ux  = macroReadBuf[bi], uy = macroReadBuf[bi + 1], rho = macroReadBuf[bi + 2];
       const spd = Math.sqrt(ux * ux + uy * uy) * state.uScale;
       sumVel  += spd;
@@ -1315,7 +1329,7 @@ function readProbeData() {
       for (const [ddx, ddy] of dirs) {
         const ni = ci + ddx, nj = cj + ddy;
         if (ni < 0 || ni >= NX || nj < 0 || nj >= NY) continue;
-        const nct = macroReadBuf[(nj * NX + ni) * 4 + 3];
+        const nct = geomData[(nj * NX + ni) * 4];
         if (nct > 0.5 && nct < 1.5) {
           sumWSS += 2.0 * state.muN * spd / DX;
           cntWall++;
@@ -1325,12 +1339,13 @@ function readProbeData() {
     }
   }
 
-  probe.mode = (centerCt > 0.5 && centerCt < 1.5) || (cntWall > 0 && cntFluid > 0 && cntWall >= cntFluid / 3)
+  probe.mode = (centerCt > 0.5 && centerCt < 1.5)
+    || (cntWall > 0 && cntFluid > 0 && cntWall >= cntFluid / 3)
     ? 'wall' : 'fluid';
 
   let value, secondary;
   if (probe.mode === 'wall' && cntWall > 0) {
-    value = sumWSS / cntWall;
+    value     = sumWSS / cntWall;
     secondary = cntFluid > 0 ? sumVel / cntFluid : 0;
   } else if (cntFluid > 0) {
     probe.mode = 'fluid';
@@ -1343,15 +1358,10 @@ function readProbeData() {
   probe.history.push({ step: stepN, value, secondary, mode: probe.mode });
   if (probe.history.length > probe.maxHistory) probe.history.shift();
 
-  const modeEl = $('probeModeLabel');
-  const valEl  = $('probeValLabel');
+  const valEl = $('probeValLabel');
   if (probe.mode === 'wall') {
-    modeEl.textContent = '● WSS probe';
-    modeEl.className = 'probe-mode-lbl wall';
     valEl.textContent = `WSS ${value.toFixed(2)} Pa   |U|near ${secondary.toFixed(3)} m/s`;
   } else {
-    modeEl.textContent = '● Fluid probe';
-    modeEl.className = 'probe-mode-lbl';
     valEl.textContent = `|U| ${value.toFixed(3)} m/s   P ${secondary.toFixed(1)} Pa`;
   }
   $('probeHistLen').textContent = probe.history.length;
@@ -1362,10 +1372,20 @@ function drawProbeOverlay() {
   probeOverlayCtx.clearRect(0, 0, ow, oh);
   if (!probe.enabled) return;
 
+  // Compute mode from geomData every frame for instant visual response.
+  const cx = Math.round(probe.nx * (NX - 1));
+  const cy = Math.round((1.0 - probe.ny) * (NY - 1));
+  const isWall = (cx >= 0 && cx < NX && cy >= 0 && cy < NY)
+    && geomData[(cy * NX + cx) * 4] > 0.5;
+
+  // Keep mode label text in sync (value label is updated by readProbeData).
+  const modeEl = $('probeModeLabel');
+  modeEl.textContent = isWall ? '● WSS probe' : '● Fluid probe';
+  modeEl.className   = isWall ? 'probe-mode-lbl wall' : 'probe-mode-lbl';
+
   const px   = probe.nx * ow;
   const py   = probe.ny * oh;
   const rPx  = probe.radiusCells * (ow / NX);
-  const isWall = probe.mode === 'wall';
   const col    = isWall ? 'rgba(245,158,11,0.18)' : 'rgba(13,148,136,0.18)';
   const stroke = isWall ? '#f59e0b' : '#0d9488';
 
@@ -1412,52 +1432,81 @@ function drawProbeGraph() {
     return;
   }
 
-  const pad = { l: 64, r: 18, t: 14, b: 28 };
+  const isWall  = h[h.length - 1].mode === 'wall';
+  const lineCol = isWall ? '#f59e0b' : '#0d9488';
+  const secCol  = isWall ? '#94a3b8' : '#38bdf8';
+  const unit    = isWall ? 'WSS (Pa)' : '|U| (m/s)';
+  const secUnit = isWall ? '|U| (m/s)' : 'P (Pa)';
+
+  // Fluid mode: dual y-axes; wall mode: single left axis
+  const pad = { l: 58, r: isWall ? 18 : 58, t: 14, b: 28 };
   const pw  = gw - pad.l - pad.r;
   const ph  = gh - pad.t - pad.b;
+  const nY  = 4;
 
-  const isWall   = h[h.length - 1].mode === 'wall';
-  const lineCol  = isWall ? '#f59e0b' : '#0d9488';
-  const secCol   = isWall ? '#94a3b8' : '#38bdf8';
-  const unit     = isWall ? 'WSS (Pa)' : '|U| (m/s)';
-  const secUnit  = isWall ? '|U| (m/s)' : 'P (Pa)';
-
+  // Primary axis range
   const vals = h.map(d => d.value).filter(isFinite);
   let yMin = Math.min(...vals), yMax = Math.max(...vals);
   const span = yMax - yMin;
   if (span < 1e-9) { yMin -= 0.01; yMax += 0.01; }
   else { yMin -= span * 0.08; yMax += span * 0.15; }
 
+  // Secondary axis range
+  const secVals = h.map(d => d.secondary).filter(isFinite);
+  let sMin = 0, sMax = 1;
+  if (secVals.length > 1) {
+    sMin = Math.min(...secVals); sMax = Math.max(...secVals);
+    const ss = sMax - sMin;
+    if (ss < 1e-9) { sMin -= 0.01; sMax += 0.01; }
+    else { sMin -= ss * 0.08; sMax += ss * 0.15; }
+  }
+
   // Grid lines
   ctx.strokeStyle = '#1e293b';
   ctx.lineWidth = 1;
-  const nY = 4;
   for (let i = 0; i <= nY; i++) {
     const yy = pad.t + ph - (i / nY) * ph;
     ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(pad.l + pw, yy); ctx.stroke();
-    const v = yMin + (i / nY) * (yMax - yMin);
-    ctx.fillStyle = '#475569';
-    ctx.font = '9px monospace';
+  }
+
+  // Left y-axis tick labels (primary)
+  ctx.font = '9px monospace';
+  for (let i = 0; i <= nY; i++) {
+    const yy = pad.t + ph - (i / nY) * ph;
+    const v  = yMin + (i / nY) * (yMax - yMin);
+    ctx.fillStyle = lineCol;
     ctx.textAlign = 'right';
     ctx.fillText(Math.abs(v) < 0.001 ? v.toExponential(1) : v.toFixed(3), pad.l - 4, yy + 3);
   }
 
-  // Axes
+  // Right y-axis tick labels (secondary — fluid mode only)
+  if (!isWall && secVals.length > 1) {
+    for (let i = 0; i <= nY; i++) {
+      const yy = pad.t + ph - (i / nY) * ph;
+      const v  = sMin + (i / nY) * (sMax - sMin);
+      ctx.fillStyle = secCol;
+      ctx.textAlign = 'left';
+      ctx.fillText(Math.abs(v) < 0.1 ? v.toExponential(1) : v.toFixed(1), pad.l + pw + 4, yy + 3);
+    }
+    ctx.strokeStyle = secCol;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l + pw, pad.t); ctx.lineTo(pad.l + pw, pad.t + ph); ctx.stroke();
+    ctx.globalAlpha = 1.0;
+  }
+
+  // Axis borders
   ctx.strokeStyle = '#334155';
   ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + ph); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(pad.l, pad.t + ph); ctx.lineTo(pad.l + pw, pad.t + ph); ctx.stroke();
 
-  // Secondary line (lighter, behind)
-  const secVals = h.map(d => d.secondary).filter(isFinite);
+  // Secondary line — in fluid mode uses its own right-axis scale
   if (secVals.length > 1) {
-    let sMin = Math.min(...secVals), sMax = Math.max(...secVals);
-    const ss = sMax - sMin;
-    if (ss < 1e-9) { sMin -= 0.01; sMax += 0.01; }
     ctx.beginPath();
     ctx.strokeStyle = secCol;
-    ctx.globalAlpha = 0.35;
-    ctx.lineWidth = 1;
+    ctx.globalAlpha = isWall ? 0.35 : 0.75;
+    ctx.lineWidth = isWall ? 1 : 1.2;
     for (let i = 0; i < h.length; i++) {
       const x = pad.l + (i / (probe.maxHistory - 1)) * pw;
       const y = pad.t + ph - ((h[i].secondary - sMin) / (sMax - sMin)) * ph;
@@ -1465,11 +1514,6 @@ function drawProbeGraph() {
     }
     ctx.stroke();
     ctx.globalAlpha = 1.0;
-    // secondary legend
-    ctx.fillStyle = secCol;
-    ctx.font = '9px monospace';
-    ctx.textAlign = 'right';
-    ctx.fillText(secUnit, gw - pad.r, pad.t + 10);
   }
 
   // Primary line
@@ -1483,22 +1527,22 @@ function drawProbeGraph() {
   }
   ctx.stroke();
 
-  // Live dot at tip
+  // Live dot
   if (h.length > 0) {
     const last = h[h.length - 1];
     const lx = pad.l + ((h.length - 1) / (probe.maxHistory - 1)) * pw;
     const ly = pad.t + ph - ((last.value - yMin) / (yMax - yMin)) * ph;
-    ctx.beginPath();
-    ctx.arc(lx, ly, 3, 0, Math.PI * 2);
-    ctx.fillStyle = lineCol;
-    ctx.fill();
+    ctx.beginPath(); ctx.arc(lx, ly, 3, 0, Math.PI * 2);
+    ctx.fillStyle = lineCol; ctx.fill();
   }
 
-  // Axis labels
+  // Bottom label
   ctx.fillStyle = '#475569';
   ctx.font = '9px monospace';
   ctx.textAlign = 'left';
   ctx.fillText('step →', pad.l + 2, pad.t + ph + 18);
+
+  // Left axis title
   ctx.save();
   ctx.translate(11, pad.t + ph / 2);
   ctx.rotate(-Math.PI / 2);
@@ -1506,6 +1550,17 @@ function drawProbeGraph() {
   ctx.fillStyle = lineCol;
   ctx.fillText(unit, 0, 0);
   ctx.restore();
+
+  // Right axis title (fluid mode only)
+  if (!isWall) {
+    ctx.save();
+    ctx.translate(gw - 10, pad.t + ph / 2);
+    ctx.rotate(Math.PI / 2);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = secCol;
+    ctx.fillText(secUnit, 0, 0);
+    ctx.restore();
+  }
 }
 
 /* ---------- Main Loop ---------- */
@@ -1747,6 +1802,8 @@ $('chkProbe').addEventListener('change', e => {
   probe.enabled = e.target.checked;
   $('probeSection').style.display = probe.enabled ? 'block' : 'none';
   probe.history = [];
+  probeDebugOnce = true;
+  probeReadCounter = 0;
   if (!probe.enabled) probeOverlayCtx.clearRect(0, 0, probeOverlayCv.width, probeOverlayCv.height);
 });
 $('chkSS').addEventListener('change', e => {
