@@ -1134,11 +1134,11 @@ function decodeRB3(buf, off) {
 
 // Run the probe aggregation shader on the GPU and read back 6 RGBA8 pixels.
 // Returns an object {ux, uy, dRho, wallSpd, nFluid, nWall} in lattice units.
-let _probeDbg = true;
 function sampleProbeGPU(cx, cy) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbeRB);
+  // Render to the canvas (null FBO) bottom-left corner — only reliable readPixels
+  // target in Firefox. renderToCanvas() runs after this and overwrites these pixels.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, 6, 1);
-  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);  // explicitly ensure draw target
   bindQuad(progProbeRead);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
@@ -1147,33 +1147,8 @@ function sampleProbeGPU(cx, cy) {
   gl.uniform1f(uProbeRead.uCX,     cx);
   gl.uniform1f(uProbeRead.uCY,     cy);
   gl.uniform1f(uProbeRead.uRadius, probe.radiusCells);
-
-  if (_probeDbg) {
-    // Step 1: clear to magenta, read back — verifies FBO readPixels works.
-    gl.clearColor(1.0, 0.0, 1.0, 1.0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
-    const afterClear = Array.from(probeRBuf.slice(0, 4));
-    gl.clearColor(0, 0, 0, 0);
-    // Step 2: draw shader, read back.
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    const errAfterDraw = gl.getError();
-    gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
-    _probeDbg = false;
-    const loc = gl.getAttribLocation(progProbeRead, 'aP');
-    console.log('[probe-dbg2]'
-      + ' afterClear(px0)=' + afterClear
-      + ' drawErr=' + errAfterDraw
-      + ' afterDraw(px0,4,5)=' + Array.from(probeRBuf.slice(0,4))
-      + '|' + Array.from(probeRBuf.slice(16,20))
-      + '|' + Array.from(probeRBuf.slice(20,24))
-      + ' aPLoc=' + loc
-      + ' cx=' + cx + ' cy=' + cy);
-  } else {
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
-  }
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
 
   const U = 0.25, D = 0.15;
   return {
@@ -1189,7 +1164,9 @@ function sampleProbeGPU(cx, cy) {
 // Run the diagnostics aggregation shader on the GPU.
 // Returns {trueMin, trueMax, p1, p5, p95, p99, ke} in physical units for applyScaleMode().
 function readDiagGPU() {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fboDiagRB);
+  // Render to canvas bottom-left corner (same reliable-readPixels trick as probe).
+  // renderToCanvas() runs after runDiagnostics() in the frame loop and overwrites.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, DIAG_W, DIAG_H);
   bindQuad(progDiagRead);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
@@ -1198,7 +1175,6 @@ function readDiagGPU() {
   gl.uniform1i(uDiagRead.uGeom,  1);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
   gl.readPixels(0, 0, DIAG_W, DIAG_H, gl.RGBA, gl.UNSIGNED_BYTE, diagRBuf);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   const vals = [], ke_acc = [];
   for (let i = 0; i < DIAG_W * DIAG_H; i++) {
