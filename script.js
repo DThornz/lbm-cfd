@@ -1524,6 +1524,20 @@ function frame(time) {
   }
   computeMacro();
 
+  // Probe readback immediately after computeMacro — the only textures bound at
+  // this point are fA/fB/fC/texGeom (used by computeMacro), NOT texMacro.
+  // advanceStream and renderToCanvas both bind texMacro later, which would make
+  // readPixels on fboMacro (which has texMacro attached) silently return zeros
+  // on many drivers. Throttled to every 8 frames (~7 Hz at 60 fps).
+  if (probe.enabled) {
+    probeReadCounter++;
+    if (probeReadCounter >= 8) {
+      probeReadCounter = 0;
+      readMacroField();
+      readProbeData();
+    }
+  }
+
   if (!paused) {
     diagFrames++;
     if (diagFrames >= diagInterval()) {
@@ -1532,17 +1546,6 @@ function frame(time) {
     }
     if (state.showParticles) advanceParticles();
     if (state.showStream)    advanceStream();
-  }
-
-  // Probe readback must happen before renderToCanvas binds texMacro as a sampler.
-  // Throttled to every 8 frames (~7 Hz at 60 fps) to avoid constant GPU stalls.
-  if (probe.enabled) {
-    probeReadCounter++;
-    if (probeReadCounter >= 8) {
-      probeReadCounter = 0;
-      readMacroField();   // GPU→CPU: updates macroReadBuf
-      readProbeData();    // pure JS: samples from macroReadBuf
-    }
   }
 
   renderToCanvas(time);
@@ -1613,7 +1616,7 @@ function isNearProbe(nx, ny) {
 canvas.addEventListener('mousedown', e => {
   if (probe.enabled) {
     const _p = probeCursorNorm(e);
-    if (isNearProbe(_p.nx, _p.ny)) { probe.dragging = true; return; }
+    if (isNearProbe(_p.nx, _p.ny)) { probe.dragging = true; probe.history = []; return; }
   }
   if (tool === 'none') return;
   drawing = true;
@@ -1626,7 +1629,7 @@ canvas.addEventListener('mousemove', e => {
     const { nx, ny } = probeCursorNorm(e);
     probe.nx = Math.max(0, Math.min(1, nx));
     probe.ny = Math.max(0, Math.min(1, ny));
-    probe.history = [];
+    probeReadCounter = 7;
     drawProbeOverlay();
     return;
   }
