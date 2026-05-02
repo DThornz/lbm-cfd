@@ -584,28 +584,22 @@ void main() {
 }`;
 
 /* ---------- Readback shaders (RGBA8 — avoids FLOAT readPixels browser issues) ---------- */
-// Probe: 6×1 RGBA8.  Each pixel packs one float via R+G+B (24-bit).
+// Probe: 1×1 RGBA8.  Single pixel, one pass — R=ux, G=uy, B=dRho, A=wallSpd (8-bit each).
+// Loop uses actual radius bounds (not hardcoded ±12) for minimum GPU work.
 const FS_PROBE_READ = `#version 300 es
 precision highp float;
 uniform sampler2D uMacro, uGeom;
 uniform float uCX, uCY, uRadius;
 out vec4 outColor;
-vec4 pack3(float v) {
-  v = clamp(v, 0.0, 1.0);
-  float r = floor(v * 255.0);
-  float g = floor((v * 255.0 - r) * 255.0);
-  float b = floor(((v * 255.0 - r) * 255.0 - g) * 255.0);
-  return vec4(r / 255.0, g / 255.0, b / 255.0, 1.0);
-}
 void main() {
-  int idx = int(gl_FragCoord.x);
   int cx = int(uCX + 0.5), cy = int(uCY + 0.5);
   ivec2 sz = textureSize(uMacro, 0);
   float sumUx = 0.0, sumUy = 0.0, sumDRho = 0.0;
   float sumWSpd = 0.0, nFluid = 0.0, nWall = 0.0;
+  int ir = int(uRadius + 0.5);
   float r2lim = uRadius * uRadius + 0.5;
-  for (int dy = -12; dy <= 12; dy++) {
-    for (int dx = -12; dx <= 12; dx++) {
+  for (int dy = -ir; dy <= ir; dy++) {
+    for (int dx = -ir; dx <= ir; dx++) {
       if (float(dx*dx + dy*dy) > r2lim) continue;
       ivec2 tc = ivec2(cx+dx, cy+dy);
       if (tc.x < 0 || tc.y < 0 || tc.x >= sz.x || tc.y >= sz.y) continue;
@@ -621,14 +615,16 @@ void main() {
     }
   }
   const float U = 0.25, D = 0.15;
-  float v;
-  if      (idx == 0) v = nFluid > 0.0 ? (sumUx   / nFluid + U) / (2.0*U) : 0.5;
-  else if (idx == 1) v = nFluid > 0.0 ? (sumUy   / nFluid + U) / (2.0*U) : 0.5;
-  else if (idx == 2) v = nFluid > 0.0 ? (sumDRho / nFluid + D) / (2.0*D) : 0.5;
-  else if (idx == 3) v = nWall  > 0.0 ? sumWSpd / nWall / U : 0.0;
-  else if (idx == 4) v = nFluid / 400.0;
-  else               v = nWall  / 400.0;
-  outColor = pack3(v);
+  float avgUx   = nFluid > 0.0 ? sumUx   / nFluid : 0.0;
+  float avgUy   = nFluid > 0.0 ? sumUy   / nFluid : 0.0;
+  float avgDRho = nFluid > 0.0 ? sumDRho / nFluid : 0.0;
+  float avgWSpd = nWall  > 0.0 ? sumWSpd / nWall  : 0.0;
+  outColor = vec4(
+    clamp((avgUx   + U) / (2.0*U), 0.0, 1.0),
+    clamp((avgUy   + U) / (2.0*U), 0.0, 1.0),
+    clamp((avgDRho + D) / (2.0*D), 0.0, 1.0),
+    clamp(avgWSpd / U,              0.0, 1.0)
+  );
 }`;
 
 // Diagnostics: DIAG_W×DIAG_H RGBA8.  Each pixel = one block of the macro field.
@@ -725,7 +721,7 @@ let fA, fB, fC, fboStep, texGeom, texMacro, fboMacro;
 let texPart, fboPart;
 let texStream, fboStream;
 let texProbeRB, fboProbeRB, texDiagRB, fboDiagRB;
-let probeRBuf = new Uint8Array(24);        // 6 pixels × 4 bytes
+let probeRBuf = new Uint8Array(4);         // 1 pixel × 4 bytes (ux,uy,dRho,wallSpd)
 let diagRBuf  = new Uint8Array(DIAG_W * DIAG_H * 4);
 let macroReadBuf = null;
 let pp = 0, pPart = 0, pStream = 0, stepN = 0, paused = false;
@@ -1127,18 +1123,13 @@ function readMacroField() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// Decode 24-bit packed float from R+G+B of probeRBuf at byte offset off.
-function decodeRB3(buf, off) {
-  return (buf[off] * 65536 + buf[off + 1] * 256 + buf[off + 2]) / 16777215;
-}
-
 // Run the probe aggregation shader on the GPU and read back 6 RGBA8 pixels.
 // Returns an object {ux, uy, dRho, wallSpd, nFluid, nWall} in lattice units.
 function sampleProbeGPU(cx, cy) {
-  // Render to the canvas (null FBO) bottom-left corner — only reliable readPixels
-  // target in Firefox. renderToCanvas() runs after this and overwrites these pixels.
+  // Render 1×1 to the canvas bottom-left — only reliable readPixels target on Firefox.
+  // renderToCanvas() overwrites this pixel every frame, so no visual artifact.
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(0, 0, 6, 1);
+  gl.viewport(0, 0, 1, 1);
   bindQuad(progProbeRead);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
@@ -1148,16 +1139,14 @@ function sampleProbeGPU(cx, cy) {
   gl.uniform1f(uProbeRead.uCY,     cy);
   gl.uniform1f(uProbeRead.uRadius, probe.radiusCells);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
 
   const U = 0.25, D = 0.15;
   return {
-    ux:      decodeRB3(probeRBuf,  0) * 2 * U - U,
-    uy:      decodeRB3(probeRBuf,  4) * 2 * U - U,
-    dRho:    decodeRB3(probeRBuf,  8) * 2 * D - D,
-    wallSpd: decodeRB3(probeRBuf, 12) * U,
-    nFluid:  Math.round(decodeRB3(probeRBuf, 16) * 400),
-    nWall:   Math.round(decodeRB3(probeRBuf, 20) * 400),
+    ux:      (probeRBuf[0] / 255) * 2 * U - U,
+    uy:      (probeRBuf[1] / 255) * 2 * U - U,
+    dRho:    (probeRBuf[2] / 255) * 2 * D - D,
+    wallSpd: (probeRBuf[3] / 255) * U,
   };
 }
 
@@ -1430,24 +1419,19 @@ function readProbeData() {
 
   const s = sampleProbeGPU(cx, cy);
 
-  // Use geomData for center cell-type (CPU-authoritative, always fresh).
+  // Mode is determined from geomData (CPU, always fresh) — never from GPU counts.
+  // This eliminates jitter when the probe is near a wall boundary.
   const centerCt = geomData[(cy * NX + cx) * 4];
-  const isWallMode = (centerCt > 0.5 && centerCt < 1.5)
-    || (s.nWall > 0 && s.nFluid > 0 && s.nWall >= s.nFluid / 3);
-
-  probe.mode = isWallMode ? 'wall' : 'fluid';
+  probe.mode = (centerCt > 0.5) ? 'wall' : 'fluid';
 
   let value, secondary;
-  if (probe.mode === 'wall' && s.nWall > 0) {
+  if (probe.mode === 'wall') {
     const spd = s.wallSpd * state.uScale;
     value     = 2.0 * state.muN * spd / DX;
-    secondary = s.nFluid > 0 ? Math.sqrt(s.ux * s.ux + s.uy * s.uy) * state.uScale : 0;
-  } else if (s.nFluid > 0) {
-    probe.mode = 'fluid';
+    secondary = Math.sqrt(s.ux * s.ux + s.uy * s.uy) * state.uScale;
+  } else {
     value     = Math.sqrt(s.ux * s.ux + s.uy * s.uy) * state.uScale;
     secondary = s.dRho * state.pScale;
-  } else {
-    return;
   }
 
   probe.history.push({ step: stepN, value, secondary, mode: probe.mode });
