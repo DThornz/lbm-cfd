@@ -579,9 +579,11 @@ void main() {
   outC = vec4(vec3(bright * 0.88, bright * 1.0, bright * 1.0), 1.0);
 }`;
 
-/* ---------- Readback shaders (RGBA8 — avoids FLOAT readPixels browser issues) ---------- */
-// Probe: 3x1 RGBA8 output, RGB only (canvas alpha:false always returns A=255, so alpha is avoided).
-// Pixel 0 RGB = means (speed, dRho, vort). Pixel 1 RGB = stds. Pixel 2 RG = WSS mean/std.
+/* ---------- Readback shaders ---------- */
+// Probe stats are computed on the CPU by reading a small window from fboMacro (FLOAT).
+// This avoids all canvas-FBO issues (alpha:false, 8-bit quantization, browser quirks).
+
+// Placeholder — not used, just prevents reference errors if any stale code checks it.
 const FS_PROBE_READ = `#version 300 es
 precision highp float;
 uniform sampler2D uMacro, uGeom;
@@ -698,9 +700,7 @@ const uPart = cacheUniforms(progPart, ['uParticles','uMacro','uGeom','uRes','uDt
 const uPartR = cacheUniforms(progPartRender, ['uParticles','uMacro','uNside']);
 const uStream = cacheUniforms(progStream, ['uNoise','uMacro','uRes','uDt','uTime','uInjectProb','uDecay']);
 
-const progProbeRead = link(VS, FS_PROBE_READ);
 const progDiagRead  = link(VS, FS_DIAG_READ);
-const uProbeRead = cacheUniforms(progProbeRead, ['uMacro','uGeom','uCX','uCY','uRadius']);
 const uDiagRead  = cacheUniforms(progDiagRead,  ['uMacro','uGeom']);
 
 /* ---------- Textures & FBOs ---------- */
@@ -740,13 +740,12 @@ let fA, fB, fC, fboStep, texGeom, texMacro, fboMacro;
 let texPart, fboPart;
 let texStream, fboStream;
 let texProbeRB, fboProbeRB, texDiagRB, fboDiagRB;
-let probeRBuf = new Uint8Array(12);        // 3 pixels × 4 bytes (means, stds, WSS)
+let probeWinBuf = null;                    // reusable Float32Array for probe CPU readback
 let diagRBuf  = new Uint8Array(DIAG_W * DIAG_H * 4);
 let macroReadBuf = null;
 let diagPBO = null;
 let diagPBOPending = false;
 let diagSync = null;
-let gpuFrame = 0, diagPBOFrame = -1;
 let pp = 0, pPart = 0, pStream = 0, stepN = 0, paused = false;
 const linearFilt = extLin ? gl.LINEAR : gl.NEAREST;
 
@@ -1152,36 +1151,72 @@ function readMacroField() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// One-shot synchronous probe sample on user click. Stall is imperceptible at click time.
+// CPU-side probe: reads a small window from fboMacro (FLOAT) and computes stats exactly.
+// Bypasses canvas FBO entirely — no 8-bit quantization, no alpha:false issues.
 function sampleProbeAtClick(cx, cy) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(0, 0, 3, 1);
-  bindQuad(progProbeRead);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
-  gl.uniform1i(uProbeRead.uMacro, 0);
-  gl.uniform1i(uProbeRead.uGeom,  1);
-  gl.uniform1f(uProbeRead.uCX,     cx);
-  gl.uniform1f(uProbeRead.uCY,     cy);
-  gl.uniform1f(uProbeRead.uRadius, probe.radiusCells);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  // Read 3 pixels: pixel0=means(RGB), pixel1=stds(RGB), pixel2=WSS(RG)+hasWall(B)
-  // Alpha is skipped — with {alpha:false} canvas, readPixels always returns A=255.
-  gl.readPixels(0, 0, 3, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+  const r = probe.radiusCells;
+  // Extend by 1 so edge cells can compute vorticity using their neighbors
+  const x0 = Math.max(0, cx - r - 1), y0 = Math.max(0, cy - r - 1);
+  const x1 = Math.min(NX - 1, cx + r + 1), y1 = Math.min(NY - 1, cy + r + 1);
+  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+  const need = bw * bh * 4;
+  if (!probeWinBuf || probeWinBuf.length < need) probeWinBuf = new Float32Array(need);
 
-  const U = 0.25, D = 0.15, V = 0.5;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
+  gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, probeWinBuf);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  const idx = (x, y) => ((y - y0) * bw + (x - x0)) * 4;
+  const inBuf = (x, y) => x >= x0 && x <= x1 && y >= y0 && y <= y1;
+  const fluid  = (x, y) => x >= 0 && x < NX && y >= 0 && y < NY && geomData[(y * NX + x) * 4] < 0.5;
+
+  let sumS=0,sumS2=0, sumD=0,sumD2=0, sumV=0,sumV2=0, sumW=0,sumW2=0;
+  let nFluid=0, nWall=0;
+  const r2lim = r * r + 0.5;
+
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      if (dx*dx + dy*dy > r2lim) continue;
+      const tx = cx + dx, ty = cy + dy;
+      if (!inBuf(tx, ty) || !fluid(tx, ty)) continue;
+
+      const i = idx(tx, ty);
+      const ux = probeWinBuf[i], uy = probeWinBuf[i+1], rho = probeWinBuf[i+2];
+      const spd = Math.hypot(ux, uy);
+      const dRho = rho - 1.0;
+
+      // Vorticity: duy/dx - dux/dy, fluid neighbors only
+      const fR = inBuf(tx+1,ty) && fluid(tx+1,ty);
+      const fL = inBuf(tx-1,ty) && fluid(tx-1,ty);
+      const fU = inBuf(tx,ty+1) && fluid(tx,ty+1);
+      const fD = inBuf(tx,ty-1) && fluid(tx,ty-1);
+      let duyDx = 0, duxDy = 0;
+      if (fR && fL)      duyDx = (probeWinBuf[idx(tx+1,ty)+1] - probeWinBuf[idx(tx-1,ty)+1]) * 0.5;
+      else if (fR)       duyDx =  probeWinBuf[idx(tx+1,ty)+1] - uy;
+      else if (fL)       duyDx =  uy - probeWinBuf[idx(tx-1,ty)+1];
+      if (fU && fD)      duxDy = (probeWinBuf[idx(tx,ty+1)]   - probeWinBuf[idx(tx,ty-1)])   * 0.5;
+      else if (fU)       duxDy =  probeWinBuf[idx(tx,ty+1)]   - ux;
+      else if (fD)       duxDy =  ux - probeWinBuf[idx(tx,ty-1)];
+      const vort = duyDx - duxDy;
+
+      sumS += spd;  sumS2 += spd*spd;
+      sumD += dRho; sumD2 += dRho*dRho;
+      sumV += vort; sumV2 += vort*vort;
+      nFluid++;
+
+      const adj = !fluid(tx+1,ty) || !fluid(tx-1,ty) || !fluid(tx,ty+1) || !fluid(tx,ty-1);
+      if (adj) { sumW += spd; sumW2 += spd*spd; nWall++; }
+    }
+  }
+
+  const n = Math.max(nFluid, 1), w = Math.max(nWall, 1);
+  const meanSpd = sumS/n, meanDRho = sumD/n, meanVort = sumV/n, meanWSpd = sumW/w;
   return {
-    meanSpd:  (probeRBuf[0] / 255) * U,
-    meanDRho: (probeRBuf[1] / 255) * 2*D - D,
-    meanVort: (probeRBuf[2] / 255) * 2*V - V,
-    // probeRBuf[3] = alpha of pixel 0 (always 255, ignored)
-    stdSpd:   (probeRBuf[4] / 255) * U,
-    stdDRho:  (probeRBuf[5] / 255) * D,
-    stdVort:  (probeRBuf[6] / 255) * V,
-    // probeRBuf[7] = alpha of pixel 1 (always 255, ignored)
-    meanWSpd: (probeRBuf[8]  / 255) * U,
-    stdWSpd:  (probeRBuf[9]  / 255) * U,
-    hasWalls: probeRBuf[10] > 127,
+    meanSpd, meanDRho, meanVort, meanWSpd,
+    stdSpd:  Math.sqrt(Math.max(0, sumS2/n  - meanSpd*meanSpd)),
+    stdDRho: Math.sqrt(Math.max(0, sumD2/n  - meanDRho*meanDRho)),
+    stdVort: Math.sqrt(Math.max(0, sumV2/n  - meanVort*meanVort)),
+    stdWSpd: Math.sqrt(Math.max(0, sumW2/w  - meanWSpd*meanWSpd)),
   };
 }
 
@@ -1215,63 +1250,26 @@ function updateProbeStats(nx, ny) {
   drawProbeOverlay();
 }
 
-// Queue diagnostics aggregation onto GPU (non-blocking). Result collected via fenceSync poll.
-function triggerDiagGPU() {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(0, 0, DIAG_W, DIAG_H);
-  bindQuad(progDiagRead);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
-  gl.uniform1i(uDiagRead.uMacro, 0);
-  gl.uniform1i(uDiagRead.uGeom,  1);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
-  gl.readPixels(0, 0, DIAG_W, DIAG_H, gl.RGBA, gl.UNSIGNED_BYTE, 0);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-  // Place a fence after the readPixels so we can poll without blocking
-  if (diagSync) gl.deleteSync(diagSync);
-  diagSync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-  gl.flush();
-  diagPBOFrame = gpuFrame;
-  diagPBOPending = true;
-}
-
-// Collect diag PBO data — only if the GPU fence has signaled (zero-stall check).
-function processDiagGPU() {
-  if (!diagPBOPending) return;
-  // Poll the fence: returns ALREADY_SIGNALED / CONDITION_SATISFIED if ready, else TIMEOUT_EXPIRED
-  const status = gl.clientWaitSync(diagSync, 0, 0);
-  if (status === gl.TIMEOUT_EXPIRED || status === gl.WAIT_FAILED) return;
-  gl.deleteSync(diagSync);
-  diagSync = null;
-  diagPBOPending = false;
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
-  gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, diagRBuf);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-
+// Decode diagRBuf into percentile stats and KE; update colormap scale.
+function decodeDiagRBuf() {
   const vals = [], ke_acc = [];
   for (let i = 0; i < DIAG_W * DIAG_H; i++) {
-    const sv     = (diagRBuf[i * 4] * 256 + diagRBuf[i * 4 + 1]) / 65535;
-    const maxSpd = sv * 0.3;
-    const dv     = (diagRBuf[i * 4 + 2] * 256 + diagRBuf[i * 4 + 3]) / 65535;
+    const sv      = (diagRBuf[i*4] * 256 + diagRBuf[i*4+1]) / 65535;
+    const maxSpd  = sv * 0.3;
+    const dv      = (diagRBuf[i*4+2] * 256 + diagRBuf[i*4+3]) / 65535;
     const avgDRho = dv * 0.4 - 0.2;
-    if (state.field === 'vel') {
-      vals.push(maxSpd * state.uScale);
-    } else if (state.field === 'pres') {
-      vals.push(avgDRho * state.pScale);
-    } else {
-      vals.push(0);
-    }
+    if (state.field === 'vel')       vals.push(maxSpd * state.uScale);
+    else if (state.field === 'pres') vals.push(avgDRho * state.pScale);
+    else                             vals.push(0);
     ke_acc.push(maxSpd * maxSpd);
   }
-
   vals.sort((a, b) => a - b);
   const n = vals.length;
-  trueMin = vals[0]; trueMax = vals[n - 1];
-  p1  = vals[Math.max(0, Math.floor(n * 0.01))];
-  p5  = vals[Math.max(0, Math.floor(n * 0.05))];
-  p95 = vals[Math.min(n - 1, Math.floor(n * 0.95))];
-  p99 = vals[Math.min(n - 1, Math.floor(n * 0.99))];
+  trueMin = vals[0]; trueMax = vals[n-1];
+  p1  = vals[Math.max(0, Math.floor(n*0.01))];
+  p5  = vals[Math.max(0, Math.floor(n*0.05))];
+  p95 = vals[Math.min(n-1, Math.floor(n*0.95))];
+  p99 = vals[Math.min(n-1, Math.floor(n*0.99))];
   applyScaleMode();
 
   const ke = ke_acc.reduce((s, v) => s + v, 0);
@@ -1283,8 +1281,7 @@ function processDiagGPU() {
     for (const v of keHistory) maxDev = Math.max(maxDev, Math.abs(v - mean));
     const rel = maxDev / Math.max(mean, 1e-9);
     if (rel < 5e-3 && stepN > 200) {
-      steadyState = true;
-      paused = true;
+      steadyState = true; paused = true;
       $('btnPlay').textContent = '▶ Resume';
       const stat = $('simStat');
       stat.textContent = '● steady state (solver stopped)';
@@ -1295,8 +1292,40 @@ function processDiagGPU() {
   diagsRun++;
 }
 
+// Render diag aggregation shader then queue PBO readback with a fence.
+// On the NEXT call, we collect the previous result first (fence poll happens once per interval).
 function runDiagnostics() {
-  triggerDiagGPU();
+  // Collect previous PBO result — fence checked only once per diag interval, not every frame.
+  if (diagPBOPending && diagSync) {
+    const status = gl.clientWaitSync(diagSync, 0, 0);
+    if (status !== gl.TIMEOUT_EXPIRED && status !== gl.WAIT_FAILED) {
+      gl.deleteSync(diagSync); diagSync = null;
+      diagPBOPending = false;
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, diagRBuf);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      decodeDiagRBuf();
+    }
+    // If fence not yet signaled, skip decode and just re-trigger below.
+    // The next interval will collect the fresh data.
+  }
+
+  // Trigger new diag collection
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, DIAG_W, DIAG_H);
+  bindQuad(progDiagRead);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
+  gl.uniform1i(uDiagRead.uMacro, 0);
+  gl.uniform1i(uDiagRead.uGeom,  1);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
+  gl.readPixels(0, 0, DIAG_W, DIAG_H, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  if (diagSync) gl.deleteSync(diagSync);
+  diagSync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+  gl.flush();
+  diagPBOPending = true;
 }
 
 function applyScaleMode() {
@@ -1679,10 +1708,6 @@ function drawProbeGraph_REMOVED() {
 
 /* ---------- Main Loop ---------- */
 function frame(time) {
-  gpuFrame++;
-  // Collect async diag PBO readback triggered 2+ frames ago — GPU is done, no stall.
-  processDiagGPU();
-
   if (!paused) {
     updateLatticeParams();
     setStepUniforms();
