@@ -745,7 +745,6 @@ let diagRBuf  = new Uint8Array(DIAG_W * DIAG_H * 4);
 let macroReadBuf = null;
 let diagPBO = null;
 let diagPBOPending = false;
-let diagSync = null;
 let pp = 0, pPart = 0, pStream = 0, stepN = 0, paused = false;
 const linearFilt = extLin ? gl.LINEAR : gl.NEAREST;
 
@@ -1162,6 +1161,7 @@ function sampleProbeAtClick(cx, cy) {
   const need = bw * bh * 4;
   if (!probeWinBuf || probeWinBuf.length < need) probeWinBuf = new Float32Array(need);
 
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); // ensure PBO not bound for client-side readPixels
   gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
   gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, probeWinBuf);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1292,26 +1292,19 @@ function decodeDiagRBuf() {
   diagsRun++;
 }
 
-// Render diag aggregation shader then queue PBO readback with a fence.
-// On the NEXT call, we collect the previous result first (fence poll happens once per interval).
+// Render diag aggregation shader to fboDiagRB, then queue async PBO readback.
+// On the NEXT call, collect the previous result without any fence or flush.
+// Safe because at least one full diag interval (≥ 0.5s) has elapsed — GPU is done.
 function runDiagnostics() {
-  // Collect previous PBO result — fence checked only once per diag interval, not every frame.
-  if (diagPBOPending && diagSync) {
-    const status = gl.clientWaitSync(diagSync, 0, 0);
-    if (status !== gl.TIMEOUT_EXPIRED && status !== gl.WAIT_FAILED) {
-      gl.deleteSync(diagSync); diagSync = null;
-      diagPBOPending = false;
-      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
-      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, diagRBuf);
-      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-      decodeDiagRBuf();
-    }
-    // If fence not yet signaled, skip decode and just re-trigger below.
-    // The next interval will collect the fresh data.
+  if (diagPBOPending) {
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, diagRBuf);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    diagPBOPending = false;
+    decodeDiagRBuf();
   }
 
-  // Trigger new diag collection
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboDiagRB);
   gl.viewport(0, 0, DIAG_W, DIAG_H);
   bindQuad(progDiagRead);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
@@ -1322,9 +1315,7 @@ function runDiagnostics() {
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
   gl.readPixels(0, 0, DIAG_W, DIAG_H, gl.RGBA, gl.UNSIGNED_BYTE, 0);
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-  if (diagSync) gl.deleteSync(diagSync);
-  diagSync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-  gl.flush();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   diagPBOPending = true;
 }
 
@@ -1559,7 +1550,6 @@ function drawProbeOverlay() {
 }
 
 function drawProbeGraph_REMOVED() {
-  return; // replaced by click-to-measure stats panel
   const gw = probeGraphCv ? probeGraphCv.clientWidth || 900 : 900;
   const ctx = null;
 
