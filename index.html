@@ -299,13 +299,31 @@
 
 <div id="probeSection" class="probe-section" style="display:none">
   <div class="probe-hdr">
-    <div style="display:flex;align-items:center;gap:12px">
-      <span id="probeModeLabel" class="probe-mode-lbl">● Probe</span>
-      <span id="probeValLabel" class="probe-val-lbl">drag probe onto vessel</span>
-    </div>
-    <span style="font-size:.72em;color:#475569">last <span id="probeHistLen">0</span> samples · probe radius: 10 cells</span>
+    <span id="probeModeLabel" class="probe-mode-lbl">● Click simulation to sample</span>
+    <span style="font-size:.72em;color:#475569">probe radius: 10 cells · click canvas to update</span>
   </div>
-  <canvas id="probeGraph" height="160" style="display:block;width:100%"></canvas>
+  <div class="probe-stats">
+    <div class="pstat-row">
+      <span class="pstat-lbl">Velocity</span>
+      <span class="pstat-val" id="pstatVel">—</span>
+      <span class="pstat-unit">m/s</span>
+    </div>
+    <div class="pstat-row">
+      <span class="pstat-lbl">Pressure</span>
+      <span class="pstat-val" id="pstatPres">—</span>
+      <span class="pstat-unit">Pa</span>
+    </div>
+    <div class="pstat-row">
+      <span class="pstat-lbl">Vorticity</span>
+      <span class="pstat-val" id="pstatVort">—</span>
+      <span class="pstat-unit">s⁻¹</span>
+    </div>
+    <div class="pstat-row">
+      <span class="pstat-lbl">WSS</span>
+      <span class="pstat-val" id="pstatWSS">—</span>
+      <span class="pstat-unit">Pa</span>
+    </div>
+  </div>
 </div>
 
 <div class="quickstart">

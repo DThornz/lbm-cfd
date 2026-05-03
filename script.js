@@ -21,19 +21,15 @@ const cbCtx = cbCv.getContext('2d');
 /* ---------- Probe ---------- */
 const probeOverlayCv = $('probeOverlay');
 const probeOverlayCtx = probeOverlayCv.getContext('2d');
-const probeGraphCv = $('probeGraph');
-const probeGraphCtx = probeGraphCv.getContext('2d');
+const probeGraphCv = null; // removed — replaced by stats panel
+const probeGraphCtx = null;
 
 const probe = {
   enabled: false,
-  nx: 0.10,        // normalized canvas X [0,1] (CSS convention, left→right)
-  ny: 0.50,        // normalized canvas Y [0,1] (CSS convention, top→bottom)
+  nx: 0.10,
+  ny: 0.50,
   radiusCells: 5,
-  mode: 'fluid',   // 'fluid' | 'wall'
-  history: [],     // {step, value, secondary} ring buffer
-  maxHistory: 500,
-  readBuf: null,
-  dragging: false,
+  clicked: false,
 };
 
 /* ---------- WebGL2 context ---------- */
@@ -585,7 +581,7 @@ void main() {
 
 /* ---------- Readback shaders (RGBA8 — avoids FLOAT readPixels browser issues) ---------- */
 // Probe: 1×1 RGBA8.  Single pixel, one pass — R=ux, G=uy, B=dRho, A=wallSpd (8-bit each).
-// Loop uses actual radius bounds (not hardcoded ±12) for minimum GPU work.
+// Probe: 2×1 RGBA8. Pixel 0 = means (speed, dRho, vort, wallSpd). Pixel 1 = stds.
 const FS_PROBE_READ = `#version 300 es
 precision highp float;
 uniform sampler2D uMacro, uGeom;
@@ -594,8 +590,8 @@ out vec4 outColor;
 void main() {
   int cx = int(uCX + 0.5), cy = int(uCY + 0.5);
   ivec2 sz = textureSize(uMacro, 0);
-  float sumUx = 0.0, sumUy = 0.0, sumDRho = 0.0;
-  float sumWSpd = 0.0, nFluid = 0.0, nWall = 0.0;
+  float sumS=0.,sumS2=0.,sumD=0.,sumD2=0.,sumV=0.,sumV2=0.,sumW=0.,sumW2=0.;
+  float nFluid=0.,nWall=0.;
   int ir = int(uRadius + 0.5);
   float r2lim = uRadius * uRadius + 0.5;
   for (int dy = -ir; dy <= ir; dy++) {
@@ -605,26 +601,52 @@ void main() {
       if (tc.x < 0 || tc.y < 0 || tc.x >= sz.x || tc.y >= sz.y) continue;
       if (texelFetch(uGeom, tc, 0).r > 0.5) continue;
       vec4 m = texelFetch(uMacro, tc, 0);
-      sumUx += m.r; sumUy += m.g; sumDRho += m.b - 1.0;
-      nFluid += 1.0;
-      bool adj = (tc.x+1 < sz.x && texelFetch(uGeom, tc+ivec2(1,0),  0).r > 0.5)
-              || (tc.x-1 >= 0   && texelFetch(uGeom, tc+ivec2(-1,0), 0).r > 0.5)
-              || (tc.y+1 < sz.y && texelFetch(uGeom, tc+ivec2(0,1),  0).r > 0.5)
-              || (tc.y-1 >= 0   && texelFetch(uGeom, tc+ivec2(0,-1), 0).r > 0.5);
-      if (adj) { sumWSpd += length(m.rg); nWall += 1.0; }
+      float spd  = length(m.rg);
+      float dRho = m.b - 1.0;
+      // Vorticity duy/dx - dux/dy using fluid neighbors only
+      ivec2 tcR=tc+ivec2(1,0),tcL=tc+ivec2(-1,0),tcU=tc+ivec2(0,1),tcD=tc+ivec2(0,-1);
+      bool fR=tcR.x<sz.x&&texelFetch(uGeom,tcR,0).r<0.5;
+      bool fL=tcL.x>=0  &&texelFetch(uGeom,tcL,0).r<0.5;
+      bool fU=tcU.y<sz.y&&texelFetch(uGeom,tcU,0).r<0.5;
+      bool fD=tcD.y>=0  &&texelFetch(uGeom,tcD,0).r<0.5;
+      float duyDx = fR&&fL ? (texelFetch(uMacro,tcR,0).g-texelFetch(uMacro,tcL,0).g)*0.5
+                  : fR     ? texelFetch(uMacro,tcR,0).g - m.g
+                  : fL     ? m.g - texelFetch(uMacro,tcL,0).g : 0.0;
+      float duxDy = fU&&fD ? (texelFetch(uMacro,tcU,0).r-texelFetch(uMacro,tcD,0).r)*0.5
+                  : fU     ? texelFetch(uMacro,tcU,0).r - m.r
+                  : fD     ? m.r - texelFetch(uMacro,tcD,0).r : 0.0;
+      float vort = duyDx - duxDy;
+      sumS+=spd; sumS2+=spd*spd; sumD+=dRho; sumD2+=dRho*dRho;
+      sumV+=vort; sumV2+=vort*vort; nFluid+=1.0;
+      bool adj=(tc.x+1<sz.x&&texelFetch(uGeom,tc+ivec2(1,0),0).r>0.5)
+             ||(tc.x-1>=0  &&texelFetch(uGeom,tc+ivec2(-1,0),0).r>0.5)
+             ||(tc.y+1<sz.y&&texelFetch(uGeom,tc+ivec2(0,1),0).r>0.5)
+             ||(tc.y-1>=0  &&texelFetch(uGeom,tc+ivec2(0,-1),0).r>0.5);
+      if (adj) { sumW+=spd; sumW2+=spd*spd; nWall+=1.0; }
     }
   }
-  const float U = 0.25, D = 0.15;
-  float avgUx   = nFluid > 0.0 ? sumUx   / nFluid : 0.0;
-  float avgUy   = nFluid > 0.0 ? sumUy   / nFluid : 0.0;
-  float avgDRho = nFluid > 0.0 ? sumDRho / nFluid : 0.0;
-  float avgWSpd = nWall  > 0.0 ? sumWSpd / nWall  : 0.0;
-  outColor = vec4(
-    clamp((avgUx   + U) / (2.0*U), 0.0, 1.0),
-    clamp((avgUy   + U) / (2.0*U), 0.0, 1.0),
-    clamp((avgDRho + D) / (2.0*D), 0.0, 1.0),
-    clamp(avgWSpd / U,              0.0, 1.0)
-  );
+  const float U=0.25,D=0.15,V=0.5;
+  float n=max(nFluid,1.0), w=max(nWall,1.0);
+  float mS=sumS/n, mD=sumD/n, mV=sumV/n, mW=sumW/w;
+  float sS=sqrt(max(0.,sumS2/n-mS*mS));
+  float sD=sqrt(max(0.,sumD2/n-mD*mD));
+  float sV=sqrt(max(0.,sumV2/n-mV*mV));
+  float sW=sqrt(max(0.,sumW2/w-mW*mW));
+  if (int(gl_FragCoord.x) == 0) {
+    outColor = vec4(
+      clamp(mS/U, 0.,1.),
+      clamp((mD+D)/(2.*D), 0.,1.),
+      clamp((mV+V)/(2.*V), 0.,1.),
+      clamp(mW/U, 0.,1.)
+    );
+  } else {
+    outColor = vec4(
+      clamp(sS/U, 0.,1.),
+      clamp(sD/D, 0.,1.),
+      clamp(sV/V, 0.,1.),
+      clamp(sW/U, 0.,1.)
+    );
+  }
 }`;
 
 // Diagnostics: DIAG_W×DIAG_H RGBA8.  Each pixel = one block of the macro field.
@@ -721,9 +743,12 @@ let fA, fB, fC, fboStep, texGeom, texMacro, fboMacro;
 let texPart, fboPart;
 let texStream, fboStream;
 let texProbeRB, fboProbeRB, texDiagRB, fboDiagRB;
-let probeRBuf = new Uint8Array(4);         // 1 pixel × 4 bytes (ux,uy,dRho,wallSpd)
+let probeRBuf = new Uint8Array(8);         // 2 pixels × 4 bytes (means + stds)
 let diagRBuf  = new Uint8Array(DIAG_W * DIAG_H * 4);
 let macroReadBuf = null;
+let diagPBO = null;
+let diagPBOPending = false;
+let gpuFrame = 0, diagPBOFrame = -1;
 let pp = 0, pPart = 0, pStream = 0, stepN = 0, paused = false;
 const linearFilt = extLin ? gl.LINEAR : gl.NEAREST;
 
@@ -761,6 +786,12 @@ function allocTextures() {
   fboProbeRB = mkFBO([texProbeRB]);
   texDiagRB  = mkTex8(DIAG_W, DIAG_H);
   fboDiagRB  = mkFBO([texDiagRB]);
+
+  diagPBO = gl.createBuffer();
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
+  gl.bufferData(gl.PIXEL_PACK_BUFFER, DIAG_W * DIAG_H * 4, gl.STREAM_READ);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+
   allocStreamTextures();
 }
 function seedParticles() {
@@ -1094,8 +1125,8 @@ let trueMin = 0, trueMax = 1;
 let p1 = 0, p5 = 0, p95 = 1, p99 = 1;
 
 const DIAG_EVERY_STEADY = 120;
-const DIAG_EVERY_STARTUP = 12;
-const STARTUP_DIAGS = 20;
+const DIAG_EVERY_STARTUP = 30;
+const STARTUP_DIAGS = 8;
 let diagFrames = 0;
 let diagsRun = 0;
 let keHistory = [];
@@ -1123,13 +1154,10 @@ function readMacroField() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// Run the probe aggregation shader on the GPU and read back 6 RGBA8 pixels.
-// Returns an object {ux, uy, dRho, wallSpd, nFluid, nWall} in lattice units.
-function sampleProbeGPU(cx, cy) {
-  // Render 1×1 to the canvas bottom-left — only reliable readPixels target on Firefox.
-  // renderToCanvas() overwrites this pixel every frame, so no visual artifact.
+// One-shot synchronous probe sample on user click. Stall is imperceptible at click time.
+function sampleProbeAtClick(cx, cy) {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(0, 0, 1, 1);
+  gl.viewport(0, 0, 2, 1);
   bindQuad(progProbeRead);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
@@ -1139,22 +1167,52 @@ function sampleProbeGPU(cx, cy) {
   gl.uniform1f(uProbeRead.uCY,     cy);
   gl.uniform1f(uProbeRead.uRadius, probe.radiusCells);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+  gl.readPixels(0, 0, 2, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
 
-  const U = 0.25, D = 0.15;
+  const U = 0.25, D = 0.15, V = 0.5;
   return {
-    ux:      (probeRBuf[0] / 255) * 2 * U - U,
-    uy:      (probeRBuf[1] / 255) * 2 * U - U,
-    dRho:    (probeRBuf[2] / 255) * 2 * D - D,
-    wallSpd: (probeRBuf[3] / 255) * U,
+    meanSpd:  (probeRBuf[0] / 255) * U,
+    meanDRho: (probeRBuf[1] / 255) * 2*D - D,
+    meanVort: (probeRBuf[2] / 255) * 2*V - V,
+    meanWSpd: (probeRBuf[3] / 255) * U,
+    stdSpd:   (probeRBuf[4] / 255) * U,
+    stdDRho:  (probeRBuf[5] / 255) * D,
+    stdVort:  (probeRBuf[6] / 255) * V,
+    stdWSpd:  (probeRBuf[7] / 255) * U,
   };
 }
 
-// Run the diagnostics aggregation shader on the GPU.
-// Returns {trueMin, trueMax, p1, p5, p95, p99, ke} in physical units for applyScaleMode().
-function readDiagGPU() {
-  // Render to canvas bottom-left corner (same reliable-readPixels trick as probe).
-  // renderToCanvas() runs after runDiagnostics() in the frame loop and overwrites.
+function updateProbeStats(nx, ny) {
+  probe.nx = nx; probe.ny = ny; probe.clicked = true;
+  const cx = Math.round(nx * (NX - 1));
+  const cy = Math.round((1.0 - ny) * (NY - 1));
+  if (cx < 0 || cx >= NX || cy < 0 || cy >= NY) return;
+
+  const s = sampleProbeAtClick(cx, cy);
+  const hasWalls = probeRBuf[3] > 0 || probeRBuf[7] > 0;
+
+  const velMean  = s.meanSpd  * state.uScale,  velStd  = s.stdSpd  * state.uScale;
+  const presMean = s.meanDRho * state.pScale,  presStd = s.stdDRho * state.pScale;
+  const vortMean = s.meanVort * state.uScale / DX, vortStd = s.stdVort * state.uScale / DX;
+  const wssMean  = 2.0 * state.muN * s.meanWSpd * state.uScale / DX;
+  const wssStd   = 2.0 * state.muN * s.stdWSpd  * state.uScale / DX;
+
+  $('pstatVel').textContent  = `${velMean.toFixed(3)}  ±  ${velStd.toFixed(3)}`;
+  $('pstatPres').textContent = `${presMean.toFixed(1)}  ±  ${presStd.toFixed(1)}`;
+  $('pstatVort').textContent = `${vortMean.toFixed(1)}  ±  ${vortStd.toFixed(1)}`;
+  $('pstatWSS').textContent  = hasWalls ? `${wssMean.toFixed(2)}  ±  ${wssStd.toFixed(2)}` : '—';
+
+  const centerCt = geomData[(cy * NX + cx) * 4];
+  const isWall = centerCt > 0.5;
+  const modeEl = $('probeModeLabel');
+  modeEl.textContent = isWall ? '● WSS probe' : '● Fluid probe';
+  modeEl.className   = isWall ? 'probe-mode-lbl wall' : 'probe-mode-lbl';
+
+  drawProbeOverlay();
+}
+
+// Queue diagnostics aggregation onto GPU (non-blocking). Result collected next frame.
+function triggerDiagGPU() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   gl.viewport(0, 0, DIAG_W, DIAG_H);
   bindQuad(progDiagRead);
@@ -1163,13 +1221,27 @@ function readDiagGPU() {
   gl.uniform1i(uDiagRead.uMacro, 0);
   gl.uniform1i(uDiagRead.uGeom,  1);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.readPixels(0, 0, DIAG_W, DIAG_H, gl.RGBA, gl.UNSIGNED_BYTE, diagRBuf);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
+  gl.readPixels(0, 0, DIAG_W, DIAG_H, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  gl.flush();
+  diagPBOFrame = gpuFrame;
+  diagPBOPending = true;
+}
+
+// Collect diag PBO data queued last frame; decode and update scale/KE. No GPU stall.
+function processDiagGPU() {
+  if (!diagPBOPending || gpuFrame < diagPBOFrame + 2) return;
+  diagPBOPending = false;
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
+  gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, diagRBuf);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
 
   const vals = [], ke_acc = [];
   for (let i = 0; i < DIAG_W * DIAG_H; i++) {
-    const sv  = (diagRBuf[i * 4] * 256 + diagRBuf[i * 4 + 1]) / 65535;
+    const sv     = (diagRBuf[i * 4] * 256 + diagRBuf[i * 4 + 1]) / 65535;
     const maxSpd = sv * 0.3;
-    const dv  = (diagRBuf[i * 4 + 2] * 256 + diagRBuf[i * 4 + 3]) / 65535;
+    const dv     = (diagRBuf[i * 4 + 2] * 256 + diagRBuf[i * 4 + 3]) / 65535;
     const avgDRho = dv * 0.4 - 0.2;
     if (state.field === 'vel') {
       vals.push(maxSpd * state.uScale);
@@ -1183,24 +1255,15 @@ function readDiagGPU() {
 
   vals.sort((a, b) => a - b);
   const n = vals.length;
-  return {
-    trueMin: vals[0],
-    trueMax: vals[n - 1],
-    p1:  vals[Math.max(0, Math.floor(n * 0.01))],
-    p5:  vals[Math.max(0, Math.floor(n * 0.05))],
-    p95: vals[Math.min(n - 1, Math.floor(n * 0.95))],
-    p99: vals[Math.min(n - 1, Math.floor(n * 0.99))],
-    ke:  ke_acc.reduce((s, v) => s + v, 0),
-  };
-}
-
-function runDiagnostics() {
-  const d = readDiagGPU();
-  trueMin = d.trueMin; trueMax = d.trueMax;
-  p1 = d.p1; p5 = d.p5; p95 = d.p95; p99 = d.p99;
+  trueMin = vals[0]; trueMax = vals[n - 1];
+  p1  = vals[Math.max(0, Math.floor(n * 0.01))];
+  p5  = vals[Math.max(0, Math.floor(n * 0.05))];
+  p95 = vals[Math.min(n - 1, Math.floor(n * 0.95))];
+  p99 = vals[Math.min(n - 1, Math.floor(n * 0.99))];
   applyScaleMode();
 
-  keHistory.push(d.ke);
+  const ke = ke_acc.reduce((s, v) => s + v, 0);
+  keHistory.push(ke);
   if (keHistory.length > KE_HISTORY_LEN) keHistory.shift();
   if (state.detectSteady && keHistory.length === KE_HISTORY_LEN) {
     const mean = keHistory.reduce((s, v) => s + v, 0) / keHistory.length;
@@ -1218,6 +1281,10 @@ function runDiagnostics() {
     }
   }
   diagsRun++;
+}
+
+function runDiagnostics() {
+  triggerDiagGPU();
 }
 
 function applyScaleMode() {
@@ -1334,7 +1401,10 @@ function renderToCanvas(time) {
 }
 
 /* ---------- Colorbar ---------- */
+let cbCachedField = null;
 function drawColorbar() {
+  if (state.field === cbCachedField) return;
+  cbCachedField = state.field;
   const w = cbCv.width, h = cbCv.height;
   cbCtx.clearRect(0, 0, w, h);
   const grad = cbCtx.createLinearGradient(0, 0, w, 0);
@@ -1411,60 +1481,20 @@ function updateStats() {
 }
 
 /* ---------- Probe ---------- */
-let probeReadCounter = 0;
-function readProbeData() {
-  const cx = Math.round(probe.nx * (NX - 1));
-  const cy = Math.round((1.0 - probe.ny) * (NY - 1));
-  if (cx < 0 || cx >= NX || cy < 0 || cy >= NY) return;
-
-  const s = sampleProbeGPU(cx, cy);
-
-  // Mode is determined from geomData (CPU, always fresh) — never from GPU counts.
-  // This eliminates jitter when the probe is near a wall boundary.
-  const centerCt = geomData[(cy * NX + cx) * 4];
-  probe.mode = (centerCt > 0.5) ? 'wall' : 'fluid';
-
-  let value, secondary;
-  if (probe.mode === 'wall') {
-    const spd = s.wallSpd * state.uScale;
-    value     = 2.0 * state.muN * spd / DX;
-    secondary = Math.sqrt(s.ux * s.ux + s.uy * s.uy) * state.uScale;
-  } else {
-    value     = Math.sqrt(s.ux * s.ux + s.uy * s.uy) * state.uScale;
-    secondary = s.dRho * state.pScale;
-  }
-
-  probe.history.push({ step: stepN, value, secondary, mode: probe.mode });
-  if (probe.history.length > probe.maxHistory) probe.history.shift();
-
-  const valEl = $('probeValLabel');
-  if (probe.mode === 'wall') {
-    valEl.textContent = `WSS ${value.toFixed(2)} Pa   |U|near ${secondary.toFixed(3)} m/s`;
-  } else {
-    valEl.textContent = `|U| ${value.toFixed(3)} m/s   P ${secondary.toFixed(1)} Pa`;
-  }
-  $('probeHistLen').textContent = probe.history.length;
-}
 
 function drawProbeOverlay() {
   const ow = probeOverlayCv.width, oh = probeOverlayCv.height;
   probeOverlayCtx.clearRect(0, 0, ow, oh);
-  if (!probe.enabled) return;
+  if (!probe.enabled || !probe.clicked) return;
 
-  // Compute mode from geomData every frame for instant visual response.
   const cx = Math.round(probe.nx * (NX - 1));
   const cy = Math.round((1.0 - probe.ny) * (NY - 1));
   const isWall = (cx >= 0 && cx < NX && cy >= 0 && cy < NY)
     && geomData[(cy * NX + cx) * 4] > 0.5;
 
-  // Keep mode label text in sync (value label is updated by readProbeData).
-  const modeEl = $('probeModeLabel');
-  modeEl.textContent = isWall ? '● WSS probe' : '● Fluid probe';
-  modeEl.className   = isWall ? 'probe-mode-lbl wall' : 'probe-mode-lbl';
-
-  const px   = probe.nx * ow;
-  const py   = probe.ny * oh;
-  const rPx  = probe.radiusCells * (ow / NX);
+  const px    = probe.nx * ow;
+  const py    = probe.ny * oh;
+  const rPx   = probe.radiusCells * (ow / NX);
   const col    = isWall ? 'rgba(245,158,11,0.18)' : 'rgba(13,148,136,0.18)';
   const stroke = isWall ? '#f59e0b' : '#0d9488';
 
@@ -1485,19 +1515,12 @@ function drawProbeOverlay() {
   probeOverlayCtx.moveTo(px - ch, py); probeOverlayCtx.lineTo(px + ch, py);
   probeOverlayCtx.moveTo(px, py - ch); probeOverlayCtx.lineTo(px, py + ch);
   probeOverlayCtx.stroke();
-
-  probeOverlayCtx.font = 'bold 10px monospace';
-  probeOverlayCtx.fillStyle = stroke;
-  probeOverlayCtx.textAlign = 'center';
-  probeOverlayCtx.fillText(isWall ? 'WSS' : '|U|', px, py - rPx - 4);
 }
 
-function drawProbeGraph() {
-  const gw = probeGraphCv.clientWidth || 900;
-  const gh = 160;
-  probeGraphCv.width  = gw;
-  probeGraphCv.height = gh;
-  const ctx = probeGraphCtx;
+function drawProbeGraph_REMOVED() {
+  return; // replaced by click-to-measure stats panel
+  const gw = probeGraphCv ? probeGraphCv.clientWidth || 900 : 900;
+  const ctx = null;
 
   ctx.fillStyle = '#000916';
   ctx.fillRect(0, 0, gw, gh);
@@ -1644,6 +1667,10 @@ function drawProbeGraph() {
 
 /* ---------- Main Loop ---------- */
 function frame(time) {
+  gpuFrame++;
+  // Collect async diag PBO readback triggered 2+ frames ago — GPU is done, no stall.
+  processDiagGPU();
+
   if (!paused) {
     updateLatticeParams();
     setStepUniforms();
@@ -1653,17 +1680,6 @@ function frame(time) {
     }
   }
   computeMacro();
-
-  // Probe readback immediately after computeMacro so texMacro is fresh.
-  // GPU shader reads texMacro via texelFetch; no float readPixels needed.
-  // Throttled to every 8 frames (~7 Hz at 60 fps).
-  if (probe.enabled) {
-    probeReadCounter++;
-    if (probeReadCounter >= 8) {
-      probeReadCounter = 0;
-      readProbeData();
-    }
-  }
 
   if (!paused) {
     diagFrames++;
@@ -1679,10 +1695,7 @@ function frame(time) {
   if (state.showParticles) renderParticles();
   drawColorbar();
 
-  if (probe.enabled) {
-    drawProbeOverlay();
-    drawProbeGraph();
-  }
+  if (probe.enabled) drawProbeOverlay();
 
   fpsN++;
   if (time - fpsT > 500) {
@@ -1734,16 +1747,11 @@ function probeCursorNorm(e) {
     ny: (e.clientY - r.top)  / r.height,
   };
 }
-function isNearProbe(nx, ny) {
-  const dx = nx - probe.nx, dy = ny - probe.ny;
-  const rNorm = probe.radiusCells / NX * 1.6; // 60% pick-up tolerance
-  return dx * dx + dy * dy < rNorm * rNorm;
-}
-
 canvas.addEventListener('mousedown', e => {
-  if (probe.enabled) {
+  if (probe.enabled && tool === 'none') {
     const _p = probeCursorNorm(e);
-    if (isNearProbe(_p.nx, _p.ny)) { probe.dragging = true; probe.history = []; return; }
+    updateProbeStats(_p.nx, _p.ny);
+    return;
   }
   if (tool === 'none') return;
   drawing = true;
@@ -1752,14 +1760,6 @@ canvas.addEventListener('mousedown', e => {
   applyBrush(i, j, isErasing ? CELL_FLUID : CELL_WALL);
 });
 canvas.addEventListener('mousemove', e => {
-  if (probe.dragging) {
-    const { nx, ny } = probeCursorNorm(e);
-    probe.nx = Math.max(0, Math.min(1, nx));
-    probe.ny = Math.max(0, Math.min(1, ny));
-    probeReadCounter = 7;
-    drawProbeOverlay();
-    return;
-  }
   const r = canvas.getBoundingClientRect();
   const ind = $('bInd');
   if (tool !== 'none') {
@@ -1778,9 +1778,8 @@ canvas.addEventListener('mousemove', e => {
     applyBrush(i, j, isErasing ? CELL_FLUID : CELL_WALL);
   }
 });
-canvas.addEventListener('mouseup', () => { probe.dragging = false; drawing = false; });
+canvas.addEventListener('mouseup', () => { drawing = false; });
 canvas.addEventListener('mouseleave', () => {
-  probe.dragging = false;
   drawing = false;
   $('bInd').style.display = 'none';
 });
@@ -1877,9 +1876,13 @@ $('chkGr').addEventListener('change', e => { state.gravity = e.target.checked; r
 $('chkProbe').addEventListener('change', e => {
   probe.enabled = e.target.checked;
   $('probeSection').style.display = probe.enabled ? 'block' : 'none';
-  probe.history = [];
-  probeReadCounter = 0;
-  if (!probe.enabled) probeOverlayCtx.clearRect(0, 0, probeOverlayCv.width, probeOverlayCv.height);
+  probe.clicked = false;
+  probeOverlayCtx.clearRect(0, 0, probeOverlayCv.width, probeOverlayCv.height);
+  if (probe.enabled) {
+    $('probeModeLabel').textContent = '● Click simulation to sample';
+    $('probeModeLabel').className = 'probe-mode-lbl';
+    ['pstatVel','pstatPres','pstatVort','pstatWSS'].forEach(id => { $(id).textContent = '—'; });
+  }
 });
 $('chkSS').addEventListener('change', e => {
   state.detectSteady = e.target.checked;
@@ -1965,7 +1968,6 @@ $('btnReset').addEventListener('click', () => {
   resetSteady();
   seedParticles();
   clearStream();
-  probe.history = [];
   forceDiagnosticsUpdate();
   if (paused) $('btnPlay').click();
 });
