@@ -1168,8 +1168,12 @@ function sampleProbeAtClick(cx, cy) {
   const need = bw * bh * 4;
   if (!probeWinBuf || probeWinBuf.length < need) probeWinBuf = new Float32Array(need);
 
+  // texMacro lives on TEXTURE0 (renderToCanvas/runDiagnostics) and TEXTURE1
+  // (advanceParticles/renderParticles). The ES3 spec makes readPixels undefined
+  // when the source texture is simultaneously bound to any sampler unit.
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, null);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, null);
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-  // Use READ_FRAMEBUFFER only (not DRAW) to avoid texMacro feedback-loop invalidation.
   gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboMacro);
   gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, probeWinBuf);
   gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
