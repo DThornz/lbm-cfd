@@ -756,7 +756,11 @@ let fA, fB, fC, fboStep, texGeom, texMacro, fboMacro;
 let texPart, fboPart;
 let texStream, fboStream;
 let texProbeRB, fboProbeRB, texDiagRB, fboDiagRB;
-const probeRBuf = new Uint8Array(6 * 4);   // readback buffer for GPU probe (6×1 RGBA8)
+let probePBO = null, probePBOAllocBytes = 0, probePBOPending = false;
+let probePBOx0=0, probePBOy0=0, probePBObw=0, probePBObh=0;
+let probePBOr=0, probePBOcx=0, probePBOcy=0;
+let probePBOBuf = new Float32Array(128 * 128 * 4);
+let probeLastStats = null;
 let diagRBuf  = new Uint8Array(DIAG_W * DIAG_H * 4);
 let macroReadBuf = null;
 let diagPBO = null;
@@ -1166,70 +1170,85 @@ function readMacroField() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// CPU-side probe: reads a small window from fboMacro (FLOAT) and computes stats exactly.
-// GPU-side probe: renders stats into the 6×1 RGBA8 fboProbeRB using FS_PROBE_READ,
-// then reads back with UNSIGNED_BYTE — avoids any float-readback format issues.
-// Pixel layout: [0]=means(spd,dRho,vort), [1]=stds(spd,dRho,vort), [2]=wall(mW,sW,hasWall).
-function sampleProbeGPU(cx, cy) {
+// Async PBO probe: kicks off a non-blocking readPixels from fboMacro into a PBO.
+// collectProbeStats() drains the PBO on the next frame and computes stats on CPU.
+// Avoids all GPU draw calls and synchronous stalls; uses exact float values.
+function kickProbeReadback(cx, cy) {
   const r = probeRadiusCells();
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbeRB);
-  if (!sampleProbeGPU._logged) {
-    const fboSt = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    const progOk = gl.getProgramParameter(progProbeRead, gl.LINK_STATUS);
-    console.log('[probe] fboProbeRB status:', fboSt === gl.FRAMEBUFFER_COMPLETE ? 'COMPLETE' : fboSt,
-      '| progProbeRead linked:', progOk,
-      '| cx cy r:', cx, cy, r,
-      '| NX NY:', NX, NY);
+  const x0=Math.max(0,cx-r-1), y0=Math.max(0,cy-r-1);
+  const x1=Math.min(NX-1,cx+r+1), y1=Math.min(NY-1,cy+r+1);
+  const bw=x1-x0+1, bh=y1-y0+1, nFloats=bw*bh*4, nBytes=nFloats*4;
+  if (!probePBO) probePBO = gl.createBuffer();
+  if (probePBOBuf.length < nFloats) probePBOBuf = new Float32Array(nFloats);
+  if (probePBOAllocBytes < nBytes) {
+    probePBOAllocBytes = nBytes;
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, nBytes, gl.STREAM_READ);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
   }
-  gl.viewport(0, 0, 6, 1);
-  bindQuad(progProbeRead);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
-  gl.uniform1i(uProbeRead.uMacro, 0);
-  gl.uniform1i(uProbeRead.uGeom,  1);
-  gl.uniform1f(uProbeRead.uCX, cx);
-  gl.uniform1f(uProbeRead.uCY, cy);
-  gl.uniform1f(uProbeRead.uRadius, r);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  if (!sampleProbeGPU._logged) {
-    sampleProbeGPU._logged = true;
-    const err = gl.getError();
-    console.log('[probe] drawArrays GL error:', err, '| raw buf after draw:',
-      Array.from(probeRBuf.slice(0,12)));  // stale, but useful if draw fails
-  }
-  gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
-  if (!sampleProbeGPU._logged2) {
-    sampleProbeGPU._logged2 = true;
-    const err2 = gl.getError();
-    console.log('[probe] readPixels GL error:', err2, '| raw buf after read:',
-      Array.from(probeRBuf.slice(0,12)));
-  }
+  probePBOx0=x0; probePBOy0=y0; probePBObw=bw; probePBObh=bh;
+  probePBOr=r; probePBOcx=cx; probePBOcy=cy;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
+  gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, 0);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-  const U = 0.25, D = 0.15, V = 0.5;
-  return {
-    meanSpd:  (probeRBuf[0] / 255) * U,
-    meanDRho: (probeRBuf[1] / 255) * 2 * D - D,
-    meanVort: (probeRBuf[2] / 255) * 2 * V - V,
-    nFluid:   Math.round(probeRBuf[3] / 255 * 250),
-    stdSpd:   (probeRBuf[4] / 255) * U,
-    stdDRho:  (probeRBuf[5] / 255) * D,
-    stdVort:  (probeRBuf[6] / 255) * V,
-    meanWSpd: (probeRBuf[8] / 255) * U,
-    stdWSpd:  (probeRBuf[9] / 255) * U,
-    hasWall:  probeRBuf[10] > 127,
-  };
+  probePBOPending = true;
 }
 
-// Records the clicked position; actual GPU readback happens in frame() right after
-// computeMacro so texMacro is never simultaneously a sampler AND the read-FBO source.
+function collectProbeStats() {
+  if (!probePBOPending) return null;
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
+  gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, probePBOBuf, 0, probePBObw*probePBObh*4);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  probePBOPending = false;
+  const r=probePBOr, cx=probePBOcx, cy=probePBOcy;
+  const x0=probePBOx0, y0=probePBOy0, bw=probePBObw;
+  const r2lim=r*r+0.5;
+  let sumS=0,sumS2=0,sumD=0,sumD2=0,sumV=0,sumV2=0,sumW=0,sumW2=0,nFluid=0,nWall=0;
+  for (let dy=-r; dy<=r; dy++) {
+    const ay=cy+dy; if (ay<0||ay>=NY) continue;
+    for (let dx=-r; dx<=r; dx++) {
+      if (dx*dx+dy*dy>r2lim) continue;
+      const ax=cx+dx; if (ax<0||ax>=NX) continue;
+      if (geomData[(ay*NX+ax)*4]>0.5) continue;
+      const bi=((ay-y0)*bw+(ax-x0))*4;
+      const ux=probePBOBuf[bi],uy=probePBOBuf[bi+1],rho=probePBOBuf[bi+2];
+      const spd=Math.sqrt(ux*ux+uy*uy), dRho=rho-1.0;
+      const axR=ax+1,axL=ax-1,ayU=ay+1,ayD=ay-1;
+      const fR=axR<NX&&geomData[(ay*NX+axR)*4]<0.5;
+      const fL=axL>=0&&geomData[(ay*NX+axL)*4]<0.5;
+      const fU=ayU<NY&&geomData[(ayU*NX+ax)*4]<0.5;
+      const fD=ayD>=0&&geomData[(ayD*NX+ax)*4]<0.5;
+      let duyDx=0, duxDy=0;
+      if (fR&&fL) duyDx=(probePBOBuf[((ay-y0)*bw+(axR-x0))*4+1]-probePBOBuf[((ay-y0)*bw+(axL-x0))*4+1])*0.5;
+      else if(fR) duyDx=probePBOBuf[((ay-y0)*bw+(axR-x0))*4+1]-uy;
+      else if(fL) duyDx=uy-probePBOBuf[((ay-y0)*bw+(axL-x0))*4+1];
+      if (fU&&fD) duxDy=(probePBOBuf[((ayU-y0)*bw+(ax-x0))*4]-probePBOBuf[((ayD-y0)*bw+(ax-x0))*4])*0.5;
+      else if(fU) duxDy=probePBOBuf[((ayU-y0)*bw+(ax-x0))*4]-ux;
+      else if(fD) duxDy=ux-probePBOBuf[((ayD-y0)*bw+(ax-x0))*4];
+      const vort=duyDx-duxDy;
+      sumS+=spd; sumS2+=spd*spd; sumD+=dRho; sumD2+=dRho*dRho;
+      sumV+=vort; sumV2+=vort*vort; nFluid++;
+      const adjWall=(axR<NX&&geomData[(ay*NX+axR)*4]>0.5)||(axL>=0&&geomData[(ay*NX+axL)*4]>0.5)
+                  ||(ayU<NY&&geomData[(ayU*NX+ax)*4]>0.5)||(ayD>=0&&geomData[(ayD*NX+ax)*4]>0.5);
+      if (adjWall) { sumW+=spd; sumW2+=spd*spd; nWall++; }
+    }
+  }
+  const n=Math.max(nFluid,1), w=Math.max(nWall,1);
+  const mS=sumS/n, mD=sumD/n, mV=sumV/n, mW=sumW/w;
+  return { meanSpd:mS, meanDRho:mD, meanVort:mV, nFluid,
+    stdSpd:Math.sqrt(Math.max(0,sumS2/n-mS*mS)),
+    stdDRho:Math.sqrt(Math.max(0,sumD2/n-mD*mD)),
+    stdVort:Math.sqrt(Math.max(0,sumV2/n-mV*mV)),
+    meanWSpd:mW, stdWSpd:Math.sqrt(Math.max(0,sumW2/w-mW*mW)), hasWall:nWall>0 };
+}
+
 function updateProbeStats(nx, ny) {
   probe.nx = nx; probe.ny = ny; probe.clicked = true;
 }
 
-// Called from frame() immediately after computeMacro().
-function refreshProbeDisplay(cx, cy) {
-  const s = sampleProbeGPU(cx, cy);
+function refreshProbeDisplay(cx, cy, s) {
   const isWall = geomData[(cy * NX + cx) * 4] > 0.5;
   const velMean  = s.meanSpd  * state.uScale,  velStd  = s.stdSpd  * state.uScale;
   const presMean = s.meanDRho * state.pScale,  presStd = s.stdDRho * state.pScale;
@@ -1704,6 +1723,19 @@ function frame(time) {
   }
   computeMacro();
 
+  // Probe: collect last frame's async PBO result, update display, kick new readback.
+  // Runs right after computeMacro so fboMacro is freshly written and not yet rebound.
+  if (probe.enabled && probe.clicked) {
+    const cx = Math.round(probe.nx * (NX - 1));
+    const cy = Math.round((1.0 - probe.ny) * (NY - 1));
+    if (cx >= 0 && cx < NX && cy >= 0 && cy < NY) {
+      const s = collectProbeStats();
+      if (s !== null) probeLastStats = s;
+      if (probeLastStats) refreshProbeDisplay(cx, cy, probeLastStats);
+      kickProbeReadback(cx, cy);
+    }
+  }
+
   if (!paused) {
     diagFrames++;
     if (diagFrames >= diagInterval()) {
@@ -1715,14 +1747,6 @@ function frame(time) {
   }
 
   renderToCanvas(time);
-  // Probe render AFTER renderToCanvas: by this point renderToCanvas has already sampled
-  // texMacro, resolving ANGLE's write-after-render hazard that caused drawArrays→1282
-  // when the probe ran immediately after computeMacro.
-  if (probe.enabled && probe.clicked) {
-    const cx = Math.round(probe.nx * (NX - 1));
-    const cy = Math.round((1.0 - probe.ny) * (NY - 1));
-    if (cx >= 0 && cx < NX && cy >= 0 && cy < NY) refreshProbeDisplay(cx, cy);
-  }
 
   if (state.showParticles) renderParticles();
   drawColorbar();
