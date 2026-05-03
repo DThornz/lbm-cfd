@@ -1703,12 +1703,6 @@ function frame(time) {
     }
   }
   computeMacro();
-  // Probe readback: texMacro is fboMacro's attachment AND not bound to any sampler here.
-  if (probe.enabled && probe.clicked) {
-    const cx = Math.round(probe.nx * (NX - 1));
-    const cy = Math.round((1.0 - probe.ny) * (NY - 1));
-    if (cx >= 0 && cx < NX && cy >= 0 && cy < NY) refreshProbeDisplay(cx, cy);
-  }
 
   if (!paused) {
     diagFrames++;
@@ -1721,6 +1715,15 @@ function frame(time) {
   }
 
   renderToCanvas(time);
+  // Probe render AFTER renderToCanvas: by this point renderToCanvas has already sampled
+  // texMacro, resolving ANGLE's write-after-render hazard that caused drawArrays→1282
+  // when the probe ran immediately after computeMacro.
+  if (probe.enabled && probe.clicked) {
+    const cx = Math.round(probe.nx * (NX - 1));
+    const cy = Math.round((1.0 - probe.ny) * (NY - 1));
+    if (cx >= 0 && cx < NX && cy >= 0 && cy < NY) refreshProbeDisplay(cx, cy);
+  }
+
   if (state.showParticles) renderParticles();
   drawColorbar();
 
