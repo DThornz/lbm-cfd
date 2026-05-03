@@ -1173,6 +1173,14 @@ function readMacroField() {
 function sampleProbeGPU(cx, cy) {
   const r = probeRadiusCells();
   gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbeRB);
+  if (!sampleProbeGPU._logged) {
+    const fboSt = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    const progOk = gl.getProgramParameter(progProbeRead, gl.LINK_STATUS);
+    console.log('[probe] fboProbeRB status:', fboSt === gl.FRAMEBUFFER_COMPLETE ? 'COMPLETE' : fboSt,
+      '| progProbeRead linked:', progOk,
+      '| cx cy r:', cx, cy, r,
+      '| NX NY:', NX, NY);
+  }
   gl.viewport(0, 0, 6, 1);
   bindQuad(progProbeRead);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
@@ -1183,7 +1191,19 @@ function sampleProbeGPU(cx, cy) {
   gl.uniform1f(uProbeRead.uCY, cy);
   gl.uniform1f(uProbeRead.uRadius, r);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
+  if (!sampleProbeGPU._logged) {
+    sampleProbeGPU._logged = true;
+    const err = gl.getError();
+    console.log('[probe] drawArrays GL error:', err, '| raw buf after draw:',
+      Array.from(probeRBuf.slice(0,12)));  // stale, but useful if draw fails
+  }
   gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+  if (!sampleProbeGPU._logged2) {
+    sampleProbeGPU._logged2 = true;
+    const err2 = gl.getError();
+    console.log('[probe] readPixels GL error:', err2, '| raw buf after read:',
+      Array.from(probeRBuf.slice(0,12)));
+  }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   const U = 0.25, D = 0.15, V = 0.5;
