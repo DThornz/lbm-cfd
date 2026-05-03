@@ -756,11 +756,9 @@ let fA, fB, fC, fboStep, texGeom, texMacro, fboMacro;
 let texPart, fboPart;
 let texStream, fboStream;
 let texProbeRB, fboProbeRB, texDiagRB, fboDiagRB;
-let probePBO = null, probePBOAllocBytes = 0, probePBOPending = false;
-let probePBOx0=0, probePBOy0=0, probePBObw=0, probePBObh=0;
-let probePBOr=0, probePBOcx=0, probePBOcy=0;
-let probePBOBuf = new Float32Array(128 * 128 * 4);
+let probeSyncBuf = new Float32Array(64 * 64 * 4);  // grows as needed
 let probeLastStats = null;
+let probeFrameTick = 0;
 let diagRBuf  = new Uint8Array(DIAG_W * DIAG_H * 4);
 let macroReadBuf = null;
 let diagPBO = null;
@@ -1170,40 +1168,20 @@ function readMacroField() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// Async PBO probe: kicks off a non-blocking readPixels from fboMacro into a PBO.
-// collectProbeStats() drains the PBO on the next frame and computes stats on CPU.
-// Avoids all GPU draw calls and synchronous stalls; uses exact float values.
-function kickProbeReadback(cx, cy) {
+// Synchronous CPU probe: reads a small float window from fboMacro directly into a
+// TypedArray (no PBO, no GL-allocated objects — avoids Firefox context-pressure failures)
+// then computes stats in JavaScript.  Throttled to every 6 frames to limit stall frequency.
+function sampleProbeCPU(cx, cy) {
   const r = probeRadiusCells();
   const x0=Math.max(0,cx-r-1), y0=Math.max(0,cy-r-1);
   const x1=Math.min(NX-1,cx+r+1), y1=Math.min(NY-1,cy+r+1);
-  const bw=x1-x0+1, bh=y1-y0+1, nFloats=bw*bh*4, nBytes=nFloats*4;
-  if (!probePBO) probePBO = gl.createBuffer();
-  if (probePBOBuf.length < nFloats) probePBOBuf = new Float32Array(nFloats);
-  if (probePBOAllocBytes < nBytes) {
-    probePBOAllocBytes = nBytes;
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
-    gl.bufferData(gl.PIXEL_PACK_BUFFER, nBytes, gl.STREAM_READ);
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-  }
-  probePBOx0=x0; probePBOy0=y0; probePBObw=bw; probePBObh=bh;
-  probePBOr=r; probePBOcx=cx; probePBOcy=cy;
+  const bw=x1-x0+1, bh=y1-y0+1, nFloats=bw*bh*4;
+  if (probeSyncBuf.length < nFloats) probeSyncBuf = new Float32Array(nFloats);
+  const buf = probeSyncBuf;
+  // computeMacro() just ran and leaves fboMacro bound; rebind explicitly for clarity.
   gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
-  gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, 0);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, buf);
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  probePBOPending = true;
-}
-
-function collectProbeStats() {
-  if (!probePBOPending) return null;
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
-  gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, probePBOBuf, 0, probePBObw*probePBObh*4);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-  probePBOPending = false;
-  const r=probePBOr, cx=probePBOcx, cy=probePBOcy;
-  const x0=probePBOx0, y0=probePBOy0, bw=probePBObw;
   const r2lim=r*r+0.5;
   let sumS=0,sumS2=0,sumD=0,sumD2=0,sumV=0,sumV2=0,sumW=0,sumW2=0,nFluid=0,nWall=0;
   for (let dy=-r; dy<=r; dy++) {
@@ -1213,7 +1191,7 @@ function collectProbeStats() {
       const ax=cx+dx; if (ax<0||ax>=NX) continue;
       if (geomData[(ay*NX+ax)*4]>0.5) continue;
       const bi=((ay-y0)*bw+(ax-x0))*4;
-      const ux=probePBOBuf[bi],uy=probePBOBuf[bi+1],rho=probePBOBuf[bi+2];
+      const ux=buf[bi],uy=buf[bi+1],rho=buf[bi+2];
       const spd=Math.sqrt(ux*ux+uy*uy), dRho=rho-1.0;
       const axR=ax+1,axL=ax-1,ayU=ay+1,ayD=ay-1;
       const fR=axR<NX&&geomData[(ay*NX+axR)*4]<0.5;
@@ -1221,12 +1199,12 @@ function collectProbeStats() {
       const fU=ayU<NY&&geomData[(ayU*NX+ax)*4]<0.5;
       const fD=ayD>=0&&geomData[(ayD*NX+ax)*4]<0.5;
       let duyDx=0, duxDy=0;
-      if (fR&&fL) duyDx=(probePBOBuf[((ay-y0)*bw+(axR-x0))*4+1]-probePBOBuf[((ay-y0)*bw+(axL-x0))*4+1])*0.5;
-      else if(fR) duyDx=probePBOBuf[((ay-y0)*bw+(axR-x0))*4+1]-uy;
-      else if(fL) duyDx=uy-probePBOBuf[((ay-y0)*bw+(axL-x0))*4+1];
-      if (fU&&fD) duxDy=(probePBOBuf[((ayU-y0)*bw+(ax-x0))*4]-probePBOBuf[((ayD-y0)*bw+(ax-x0))*4])*0.5;
-      else if(fU) duxDy=probePBOBuf[((ayU-y0)*bw+(ax-x0))*4]-ux;
-      else if(fD) duxDy=ux-probePBOBuf[((ayD-y0)*bw+(ax-x0))*4];
+      if (fR&&fL) duyDx=(buf[((ay-y0)*bw+(axR-x0))*4+1]-buf[((ay-y0)*bw+(axL-x0))*4+1])*0.5;
+      else if(fR) duyDx=buf[((ay-y0)*bw+(axR-x0))*4+1]-uy;
+      else if(fL) duyDx=uy-buf[((ay-y0)*bw+(axL-x0))*4+1];
+      if (fU&&fD) duxDy=(buf[((ayU-y0)*bw+(ax-x0))*4]-buf[((ayD-y0)*bw+(ax-x0))*4])*0.5;
+      else if(fU) duxDy=buf[((ayU-y0)*bw+(ax-x0))*4]-ux;
+      else if(fD) duxDy=ux-buf[((ayD-y0)*bw+(ax-x0))*4];
       const vort=duyDx-duxDy;
       sumS+=spd; sumS2+=spd*spd; sumD+=dRho; sumD2+=dRho*dRho;
       sumV+=vort; sumV2+=vort*vort; nFluid++;
@@ -1729,10 +1707,12 @@ function frame(time) {
     const cx = Math.round(probe.nx * (NX - 1));
     const cy = Math.round((1.0 - probe.ny) * (NY - 1));
     if (cx >= 0 && cx < NX && cy >= 0 && cy < NY) {
-      const s = collectProbeStats();
-      if (s !== null) probeLastStats = s;
+      // Throttle readback to every 6 frames to limit synchronous GPU stall frequency.
+      if (++probeFrameTick >= 6) {
+        probeFrameTick = 0;
+        probeLastStats = sampleProbeCPU(cx, cy);
+      }
       if (probeLastStats) refreshProbeDisplay(cx, cy, probeLastStats);
-      kickProbeReadback(cx, cy);
     }
   }
 
