@@ -28,9 +28,16 @@ const probe = {
   enabled: false,
   nx: 0.10,
   ny: 0.50,
-  radiusCells: 5,
+  radiusMm: 0.7,
   clicked: false,
 };
+function probeRadiusCells() {
+  return Math.max(2, Math.round(probe.radiusMm * 1e-3 / DX));
+}
+function updateProbeRadLabel() {
+  const el = $('probeRadLabel');
+  if (el) el.textContent = `${probe.radiusMm.toFixed(1)} mm (${probeRadiusCells()} cells)`;
+}
 
 /* ---------- WebGL2 context ---------- */
 const gl = canvas.getContext('webgl2', { alpha: false, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: false });
@@ -1153,7 +1160,7 @@ function readMacroField() {
 // CPU-side probe: reads a small window from fboMacro (FLOAT) and computes stats exactly.
 // Bypasses canvas FBO entirely — no 8-bit quantization, no alpha:false issues.
 function sampleProbeAtClick(cx, cy) {
-  const r = probe.radiusCells;
+  const r = probeRadiusCells();
   // Extend by 1 so edge cells can compute vorticity using their neighbors
   const x0 = Math.max(0, cx - r - 1), y0 = Math.max(0, cy - r - 1);
   const x1 = Math.min(NX - 1, cx + r + 1), y1 = Math.min(NY - 1, cy + r + 1);
@@ -1161,10 +1168,11 @@ function sampleProbeAtClick(cx, cy) {
   const need = bw * bh * 4;
   if (!probeWinBuf || probeWinBuf.length < need) probeWinBuf = new Float32Array(need);
 
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); // ensure PBO not bound for client-side readPixels
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  // Use READ_FRAMEBUFFER only (not DRAW) to avoid texMacro feedback-loop invalidation.
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboMacro);
   gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, probeWinBuf);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
 
   const idx = (x, y) => ((y - y0) * bw + (x - x0)) * 4;
   const inBuf = (x, y) => x >= x0 && x <= x1 && y >= y0 && y <= y1;
@@ -1240,8 +1248,8 @@ function updateProbeStats(nx, ny) {
   $('pstatVel').textContent  = `${velMean.toFixed(3)}  ±  ${velStd.toFixed(3)}`;
   $('pstatPres').textContent = `${presMean.toFixed(1)}  ±  ${presStd.toFixed(1)}`;
   $('pstatVort').textContent = `${vortMean.toFixed(1)}  ±  ${vortStd.toFixed(1)}`;
-  // WSS only shown when center cell is a wall
   $('pstatWSS').textContent  = isWall ? `${wssMean.toFixed(2)}  ±  ${wssStd.toFixed(2)}` : '—';
+  updateProbeRadLabel();
 
   const modeEl = $('probeModeLabel');
   modeEl.textContent = isWall ? '● WSS probe' : '● Fluid probe';
@@ -1526,7 +1534,7 @@ function drawProbeOverlay() {
 
   const px    = probe.nx * ow;
   const py    = probe.ny * oh;
-  const rPx   = probe.radiusCells * (ow / NX);
+  const rPx   = probeRadiusCells() * (ow / NX);
   const col    = isWall ? 'rgba(245,158,11,0.18)' : 'rgba(13,148,136,0.18)';
   const stroke = isWall ? '#f59e0b' : '#0d9488';
 
@@ -1910,6 +1918,10 @@ $('chkProbe').addEventListener('change', e => {
     $('probeModeLabel').className = 'probe-mode-lbl';
     ['pstatVel','pstatPres','pstatVort','pstatWSS'].forEach(id => { $(id).textContent = '—'; });
   }
+});
+$('slProbeR').addEventListener('input', e => {
+  probe.radiusMm = parseFloat(e.target.value);
+  updateProbeRadLabel();
 });
 $('chkSS').addEventListener('change', e => {
   state.detectSteady = e.target.checked;
