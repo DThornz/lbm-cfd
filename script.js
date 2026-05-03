@@ -34,9 +34,16 @@ const probe = {
 function probeRadiusCells() {
   return Math.max(2, Math.round(probe.radiusMm * 1e-3 / DX));
 }
-function updateProbeRadLabel() {
+function updateProbeRadLabel(nFluid) {
   const el = $('probeRadLabel');
-  if (el) el.textContent = `${probe.radiusMm.toFixed(1)} mm (${probeRadiusCells()} cells)`;
+  if (!el) return;
+  const rCells = probeRadiusCells();
+  if (nFluid === undefined) {
+    el.textContent = `${probe.radiusMm.toFixed(1)} mm (${rCells} cells)`;
+  } else {
+    const warn = nFluid < 5 ? ' ⚠ move to open fluid' : '';
+    el.textContent = `${probe.radiusMm.toFixed(1)} mm · ${nFluid}/${rCells}² cells${warn}`;
+  }
 }
 
 /* ---------- WebGL2 context ---------- */
@@ -647,7 +654,7 @@ void main() {
   float sW = sqrt(max(0., sumW2/w  - mW*mW));
   int px = int(gl_FragCoord.x);
   if (px == 0) {
-    outColor = vec4(clamp(mS/U, 0.,1.), clamp((mD+D)/(2.*D), 0.,1.), clamp((mV+V)/(2.*V), 0.,1.), 0.);
+    outColor = vec4(clamp(mS/U, 0.,1.), clamp((mD+D)/(2.*D), 0.,1.), clamp((mV+V)/(2.*V), 0.,1.), clamp(nFluid/250., 0., 1.));
   } else if (px == 1) {
     outColor = vec4(clamp(sS/U, 0.,1.), clamp(sD/D, 0.,1.), clamp(sV/V, 0.,1.), 0.);
   } else {
@@ -1184,6 +1191,7 @@ function sampleProbeGPU(cx, cy) {
     meanSpd:  (probeRBuf[0] / 255) * U,
     meanDRho: (probeRBuf[1] / 255) * 2 * D - D,
     meanVort: (probeRBuf[2] / 255) * 2 * V - V,
+    nFluid:   Math.round(probeRBuf[3] / 255 * 250),
     stdSpd:   (probeRBuf[4] / 255) * U,
     stdDRho:  (probeRBuf[5] / 255) * D,
     stdVort:  (probeRBuf[6] / 255) * V,
@@ -1212,7 +1220,7 @@ function refreshProbeDisplay(cx, cy) {
   $('pstatPres').textContent = `${presMean.toFixed(1)}  ±  ${presStd.toFixed(1)}`;
   $('pstatVort').textContent = `${vortMean.toFixed(1)}  ±  ${vortStd.toFixed(1)}`;
   $('pstatWSS').textContent  = s.hasWall ? `${wssMean.toFixed(2)}  ±  ${wssStd.toFixed(2)}` : '—';
-  updateProbeRadLabel();
+  updateProbeRadLabel(s.nFluid);
   const modeEl = $('probeModeLabel');
   modeEl.textContent = isWall ? '● WSS probe' : '● Fluid probe';
   modeEl.className   = isWall ? 'probe-mode-lbl wall' : 'probe-mode-lbl';
