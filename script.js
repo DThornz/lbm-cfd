@@ -709,6 +709,8 @@ const uStream = cacheUniforms(progStream, ['uNoise','uMacro','uRes','uDt','uTime
 
 const progDiagRead  = link(VS, FS_DIAG_READ);
 const uDiagRead  = cacheUniforms(progDiagRead,  ['uMacro','uGeom']);
+const progProbeRead = link(VS, FS_PROBE_READ);
+const uProbeRead = cacheUniforms(progProbeRead, ['uMacro','uGeom','uCX','uCY','uRadius']);
 
 /* ---------- Textures & FBOs ---------- */
 function mkTex(w, h, filter) {
@@ -747,7 +749,7 @@ let fA, fB, fC, fboStep, texGeom, texMacro, fboMacro;
 let texPart, fboPart;
 let texStream, fboStream;
 let texProbeRB, fboProbeRB, texDiagRB, fboDiagRB;
-let probeWinBuf = null;                    // reusable Float32Array for probe CPU readback
+const probeRBuf = new Uint8Array(6 * 4);   // readback buffer for GPU probe (6×1 RGBA8)
 let diagRBuf  = new Uint8Array(DIAG_W * DIAG_H * 4);
 let macroReadBuf = null;
 let diagPBO = null;
@@ -1158,85 +1160,36 @@ function readMacroField() {
 }
 
 // CPU-side probe: reads a small window from fboMacro (FLOAT) and computes stats exactly.
-// Bypasses canvas FBO entirely — no 8-bit quantization, no alpha:false issues.
-function sampleProbeAtClick(cx, cy) {
+// GPU-side probe: renders stats into the 6×1 RGBA8 fboProbeRB using FS_PROBE_READ,
+// then reads back with UNSIGNED_BYTE — avoids any float-readback format issues.
+// Pixel layout: [0]=means(spd,dRho,vort), [1]=stds(spd,dRho,vort), [2]=wall(mW,sW,hasWall).
+function sampleProbeGPU(cx, cy) {
   const r = probeRadiusCells();
-  // Extend by 1 so edge cells can compute vorticity using their neighbors
-  const x0 = Math.max(0, cx - r - 1), y0 = Math.max(0, cy - r - 1);
-  const x1 = Math.min(NX - 1, cx + r + 1), y1 = Math.min(NY - 1, cy + r + 1);
-  const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
-  const need = bw * bh * 4;
-  if (!probeWinBuf || probeWinBuf.length < need) probeWinBuf = new Float32Array(need);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbeRB);
+  gl.viewport(0, 0, 6, 1);
+  bindQuad(progProbeRead);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texMacro);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texGeom);
+  gl.uniform1i(uProbeRead.uMacro, 0);
+  gl.uniform1i(uProbeRead.uGeom,  1);
+  gl.uniform1f(uProbeRead.uCX, cx);
+  gl.uniform1f(uProbeRead.uCY, cy);
+  gl.uniform1f(uProbeRead.uRadius, r);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
-  // texMacro lives on TEXTURE0 (renderToCanvas/runDiagnostics) and TEXTURE1
-  // (advanceParticles/renderParticles). The ES3 spec makes readPixels undefined
-  // when the source texture is simultaneously bound to any sampler unit.
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, null);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, null);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboMacro);
-  gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, probeWinBuf);
-  if (!sampleProbeAtClick._logged) {
-    sampleProbeAtClick._logged = true;
-    console.log('[probe] GL error after readPixels:', gl.getError(),
-      '| IMPL_FORMAT:', gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT),
-      '| IMPL_TYPE:', gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE),
-      '| buf[0..7]:', Array.from(probeWinBuf.slice(0, 8)).map(v => v.toFixed(4)),
-      '| cx cy:', cx, cy, '| x0 y0 bw bh:', x0, y0, bw, bh);
-  }
-  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
-
-  const idx = (x, y) => ((y - y0) * bw + (x - x0)) * 4;
-  const inBuf = (x, y) => x >= x0 && x <= x1 && y >= y0 && y <= y1;
-  const fluid  = (x, y) => x >= 0 && x < NX && y >= 0 && y < NY && geomData[(y * NX + x) * 4] < 0.5;
-
-  let sumS=0,sumS2=0, sumD=0,sumD2=0, sumV=0,sumV2=0, sumW=0,sumW2=0;
-  let nFluid=0, nWall=0;
-  const r2lim = r * r + 0.5;
-
-  for (let dy = -r; dy <= r; dy++) {
-    for (let dx = -r; dx <= r; dx++) {
-      if (dx*dx + dy*dy > r2lim) continue;
-      const tx = cx + dx, ty = cy + dy;
-      if (!inBuf(tx, ty) || !fluid(tx, ty)) continue;
-
-      const i = idx(tx, ty);
-      const ux = probeWinBuf[i], uy = probeWinBuf[i+1], rho = probeWinBuf[i+2];
-      const spd = Math.hypot(ux, uy);
-      const dRho = rho - 1.0;
-
-      // Vorticity: duy/dx - dux/dy, fluid neighbors only
-      const fR = inBuf(tx+1,ty) && fluid(tx+1,ty);
-      const fL = inBuf(tx-1,ty) && fluid(tx-1,ty);
-      const fU = inBuf(tx,ty+1) && fluid(tx,ty+1);
-      const fD = inBuf(tx,ty-1) && fluid(tx,ty-1);
-      let duyDx = 0, duxDy = 0;
-      if (fR && fL)      duyDx = (probeWinBuf[idx(tx+1,ty)+1] - probeWinBuf[idx(tx-1,ty)+1]) * 0.5;
-      else if (fR)       duyDx =  probeWinBuf[idx(tx+1,ty)+1] - uy;
-      else if (fL)       duyDx =  uy - probeWinBuf[idx(tx-1,ty)+1];
-      if (fU && fD)      duxDy = (probeWinBuf[idx(tx,ty+1)]   - probeWinBuf[idx(tx,ty-1)])   * 0.5;
-      else if (fU)       duxDy =  probeWinBuf[idx(tx,ty+1)]   - ux;
-      else if (fD)       duxDy =  ux - probeWinBuf[idx(tx,ty-1)];
-      const vort = duyDx - duxDy;
-
-      sumS += spd;  sumS2 += spd*spd;
-      sumD += dRho; sumD2 += dRho*dRho;
-      sumV += vort; sumV2 += vort*vort;
-      nFluid++;
-
-      const adj = !fluid(tx+1,ty) || !fluid(tx-1,ty) || !fluid(tx,ty+1) || !fluid(tx,ty-1);
-      if (adj) { sumW += spd; sumW2 += spd*spd; nWall++; }
-    }
-  }
-
-  const n = Math.max(nFluid, 1), w = Math.max(nWall, 1);
-  const meanSpd = sumS/n, meanDRho = sumD/n, meanVort = sumV/n, meanWSpd = sumW/w;
+  const U = 0.25, D = 0.15, V = 0.5;
   return {
-    meanSpd, meanDRho, meanVort, meanWSpd,
-    stdSpd:  Math.sqrt(Math.max(0, sumS2/n  - meanSpd*meanSpd)),
-    stdDRho: Math.sqrt(Math.max(0, sumD2/n  - meanDRho*meanDRho)),
-    stdVort: Math.sqrt(Math.max(0, sumV2/n  - meanVort*meanVort)),
-    stdWSpd: Math.sqrt(Math.max(0, sumW2/w  - meanWSpd*meanWSpd)),
+    meanSpd:  (probeRBuf[0] / 255) * U,
+    meanDRho: (probeRBuf[1] / 255) * 2 * D - D,
+    meanVort: (probeRBuf[2] / 255) * 2 * V - V,
+    stdSpd:   (probeRBuf[4] / 255) * U,
+    stdDRho:  (probeRBuf[5] / 255) * D,
+    stdVort:  (probeRBuf[6] / 255) * V,
+    meanWSpd: (probeRBuf[8] / 255) * U,
+    stdWSpd:  (probeRBuf[9] / 255) * U,
+    hasWall:  probeRBuf[10] > 127,
   };
 }
 
@@ -1246,13 +1199,10 @@ function updateProbeStats(nx, ny) {
   probe.nx = nx; probe.ny = ny; probe.clicked = true;
 }
 
-// Called from frame() immediately after computeMacro(). At that point fboMacro is the
-// current read framebuffer and texMacro is NOT bound to any sampler unit, so readPixels
-// is well-defined with no feedback loop.
+// Called from frame() immediately after computeMacro().
 function refreshProbeDisplay(cx, cy) {
-  const s = sampleProbeAtClick(cx, cy);
-  const centerCt = geomData[(cy * NX + cx) * 4];
-  const isWall = centerCt > 0.5;
+  const s = sampleProbeGPU(cx, cy);
+  const isWall = geomData[(cy * NX + cx) * 4] > 0.5;
   const velMean  = s.meanSpd  * state.uScale,  velStd  = s.stdSpd  * state.uScale;
   const presMean = s.meanDRho * state.pScale,  presStd = s.stdDRho * state.pScale;
   const vortMean = s.meanVort * state.uScale / DX, vortStd = s.stdVort * state.uScale / DX;
@@ -1261,7 +1211,7 @@ function refreshProbeDisplay(cx, cy) {
   $('pstatVel').textContent  = `${velMean.toFixed(3)}  ±  ${velStd.toFixed(3)}`;
   $('pstatPres').textContent = `${presMean.toFixed(1)}  ±  ${presStd.toFixed(1)}`;
   $('pstatVort').textContent = `${vortMean.toFixed(1)}  ±  ${vortStd.toFixed(1)}`;
-  $('pstatWSS').textContent  = isWall ? `${wssMean.toFixed(2)}  ±  ${wssStd.toFixed(2)}` : '—';
+  $('pstatWSS').textContent  = s.hasWall ? `${wssMean.toFixed(2)}  ±  ${wssStd.toFixed(2)}` : '—';
   updateProbeRadLabel();
   const modeEl = $('probeModeLabel');
   modeEl.textContent = isWall ? '● WSS probe' : '● Fluid probe';
