@@ -1176,6 +1176,14 @@ function sampleProbeAtClick(cx, cy) {
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
   gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboMacro);
   gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, probeWinBuf);
+  if (!sampleProbeAtClick._logged) {
+    sampleProbeAtClick._logged = true;
+    console.log('[probe] GL error after readPixels:', gl.getError(),
+      '| IMPL_FORMAT:', gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT),
+      '| IMPL_TYPE:', gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE),
+      '| buf[0..7]:', Array.from(probeWinBuf.slice(0, 8)).map(v => v.toFixed(4)),
+      '| cx cy:', cx, cy, '| x0 y0 bw bh:', x0, y0, bw, bh);
+  }
   gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
 
   const idx = (x, y) => ((y - y0) * bw + (x - x0)) * 4;
