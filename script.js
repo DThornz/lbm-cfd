@@ -1232,34 +1232,32 @@ function sampleProbeAtClick(cx, cy) {
   };
 }
 
+// Records the clicked position; actual GPU readback happens in frame() right after
+// computeMacro so texMacro is never simultaneously a sampler AND the read-FBO source.
 function updateProbeStats(nx, ny) {
   probe.nx = nx; probe.ny = ny; probe.clicked = true;
-  const cx = Math.round(nx * (NX - 1));
-  const cy = Math.round((1.0 - ny) * (NY - 1));
-  if (cx < 0 || cx >= NX || cy < 0 || cy >= NY) return;
+}
 
+// Called from frame() immediately after computeMacro(). At that point fboMacro is the
+// current read framebuffer and texMacro is NOT bound to any sampler unit, so readPixels
+// is well-defined with no feedback loop.
+function refreshProbeDisplay(cx, cy) {
   const s = sampleProbeAtClick(cx, cy);
-
   const centerCt = geomData[(cy * NX + cx) * 4];
   const isWall = centerCt > 0.5;
-
   const velMean  = s.meanSpd  * state.uScale,  velStd  = s.stdSpd  * state.uScale;
   const presMean = s.meanDRho * state.pScale,  presStd = s.stdDRho * state.pScale;
   const vortMean = s.meanVort * state.uScale / DX, vortStd = s.stdVort * state.uScale / DX;
   const wssMean  = 2.0 * state.muN * s.meanWSpd * state.uScale / DX;
   const wssStd   = 2.0 * state.muN * s.stdWSpd  * state.uScale / DX;
-
   $('pstatVel').textContent  = `${velMean.toFixed(3)}  ±  ${velStd.toFixed(3)}`;
   $('pstatPres').textContent = `${presMean.toFixed(1)}  ±  ${presStd.toFixed(1)}`;
   $('pstatVort').textContent = `${vortMean.toFixed(1)}  ±  ${vortStd.toFixed(1)}`;
   $('pstatWSS').textContent  = isWall ? `${wssMean.toFixed(2)}  ±  ${wssStd.toFixed(2)}` : '—';
   updateProbeRadLabel();
-
   const modeEl = $('probeModeLabel');
   modeEl.textContent = isWall ? '● WSS probe' : '● Fluid probe';
   modeEl.className   = isWall ? 'probe-mode-lbl wall' : 'probe-mode-lbl';
-
-  drawProbeOverlay();
 }
 
 // Decode diagRBuf into percentile stats and KE; update colormap scale.
@@ -1719,6 +1717,12 @@ function frame(time) {
     }
   }
   computeMacro();
+  // Probe readback: texMacro is fboMacro's attachment AND not bound to any sampler here.
+  if (probe.enabled && probe.clicked) {
+    const cx = Math.round(probe.nx * (NX - 1));
+    const cy = Math.round((1.0 - probe.ny) * (NY - 1));
+    if (cx >= 0 && cx < NX && cy >= 0 && cy < NY) refreshProbeDisplay(cx, cy);
+  }
 
   if (!paused) {
     diagFrames++;
