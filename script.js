@@ -121,14 +121,13 @@ gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 
 function bindQuad(prog) {
   gl.useProgram(prog);
   gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-  const loc = gl.getAttribLocation(prog, 'aP');
-  gl.enableVertexAttribArray(loc);
-  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 }
 
 /* ---------- Shaders (same as before, verified) ---------- */
 const VS = `#version 300 es
-in vec2 aP;
+layout(location = 0) in vec2 aP;
 out vec2 vUV;
 void main(){ vUV = aP * 0.5 + 0.5; gl_Position = vec4(aP, 0.0, 1.0); }`;
 
@@ -600,12 +599,12 @@ void main() {
 // Placeholder — not used, just prevents reference errors if any stale code checks it.
 const FS_PROBE_READ = `#version 300 es
 precision highp float;
-uniform sampler2D uMacro, uGeom;
+uniform sampler2D uFA, uFB, uFC, uGeom;
 uniform float uCX, uCY, uRadius;
 out vec4 outColor;
 void main() {
   int cx = int(uCX + 0.5), cy = int(uCY + 0.5);
-  ivec2 sz = textureSize(uMacro, 0);
+  ivec2 sz = textureSize(uGeom, 0);
   float sumS=0.,sumS2=0.,sumD=0.,sumD2=0.,sumV=0.,sumV2=0.,sumW=0.,sumW2=0.;
   float nFluid=0.,nWall=0.;
   int ir = int(uRadius + 0.5);
@@ -615,10 +614,20 @@ void main() {
       if (float(dx*dx + dy*dy) > r2lim) continue;
       ivec2 tc = ivec2(cx+dx, cy+dy);
       if (tc.x < 0 || tc.y < 0 || tc.x >= sz.x || tc.y >= sz.y) continue;
-      if (texelFetch(uGeom, tc, 0).r > 0.5) continue;
-      vec4 m = texelFetch(uMacro, tc, 0);
-      float spd  = length(m.rg);
-      float dRho = m.b - 1.0;
+      vec4 G = texelFetch(uGeom, tc, 0);
+      if (G.r > 0.5) continue;
+
+      // Compute macroscopic values from distributions (same as FS_MACRO)
+      vec4 A = texelFetch(uFA, tc, 0);
+      vec4 B = texelFetch(uFB, tc, 0);
+      vec4 C = texelFetch(uFC, tc, 0);
+      float rho = A.r+A.g+A.b+A.a + B.r+B.g+B.b+B.a + C.r;
+      float ux = (A.g - A.a + B.g - B.b - B.a + C.r) / max(rho, 1e-6);
+      float uy = (A.b - B.r + B.g + B.b - B.a - C.r) / max(rho, 1e-6);
+      float spd = length(vec2(ux, uy));
+      float dRho = rho - 1.0;
+
+      // Vorticity (same neighbours logic as before)
       ivec2 tcR=tc+ivec2(1,0), tcL=tc+ivec2(-1,0);
       ivec2 tcU=tc+ivec2(0,1), tcD=tc+ivec2(0,-1);
       bool fR = tcR.x < sz.x && texelFetch(uGeom, tcR, 0).r < 0.5;
@@ -626,14 +635,47 @@ void main() {
       bool fU = tcU.y < sz.y && texelFetch(uGeom, tcU, 0).r < 0.5;
       bool fD = tcD.y >= 0   && texelFetch(uGeom, tcD, 0).r < 0.5;
       float duyDx = 0.0;
-      if (fR && fL)      { duyDx = (texelFetch(uMacro, tcR, 0).g - texelFetch(uMacro, tcL, 0).g) * 0.5; }
-      else if (fR)       { duyDx = texelFetch(uMacro, tcR, 0).g - m.g; }
-      else if (fL)       { duyDx = m.g - texelFetch(uMacro, tcL, 0).g; }
+      if (fR && fL) {
+        vec4 AR = texelFetch(uFA, tcR, 0), BR = texelFetch(uFB, tcR, 0), CR = texelFetch(uFC, tcR, 0);
+        float rhoR = AR.r+AR.g+AR.b+AR.a + BR.r+BR.g+BR.b+BR.a + CR.r;
+        float uyR = (AR.b - BR.r + BR.g + BR.b - BR.a - CR.r) / max(rhoR, 1e-6);
+        vec4 AL = texelFetch(uFA, tcL, 0), BL = texelFetch(uFB, tcL, 0), CL = texelFetch(uFC, tcL, 0);
+        float rhoL = AL.r+AL.g+AL.b+AL.a + BL.r+BL.g+BL.b+BL.a + CL.r;
+        float uyL = (AL.b - BL.r + BL.g + BL.b - BL.a - CL.r) / max(rhoL, 1e-6);
+        duyDx = (uyR - uyL) * 0.5;
+      } else if (fR) {
+        vec4 AR = texelFetch(uFA, tcR, 0), BR = texelFetch(uFB, tcR, 0), CR = texelFetch(uFC, tcR, 0);
+        float rhoR = AR.r+AR.g+AR.b+AR.a + BR.r+BR.g+BR.b+BR.a + CR.r;
+        float uyR = (AR.b - BR.r + BR.g + BR.b - BR.a - CR.r) / max(rhoR, 1e-6);
+        duyDx = uyR - uy;
+      } else if (fL) {
+        vec4 AL = texelFetch(uFA, tcL, 0), BL = texelFetch(uFB, tcL, 0), CL = texelFetch(uFC, tcL, 0);
+        float rhoL = AL.r+AL.g+AL.b+AL.a + BL.r+BL.g+BL.b+BL.a + CL.r;
+        float uyL = (AL.b - BL.r + BL.g + BL.b - BL.a - CL.r) / max(rhoL, 1e-6);
+        duyDx = uy - uyL;
+      }
       float duxDy = 0.0;
-      if (fU && fD)      { duxDy = (texelFetch(uMacro, tcU, 0).r - texelFetch(uMacro, tcD, 0).r) * 0.5; }
-      else if (fU)       { duxDy = texelFetch(uMacro, tcU, 0).r - m.r; }
-      else if (fD)       { duxDy = m.r - texelFetch(uMacro, tcD, 0).r; }
+      if (fU && fD) {
+        vec4 AU = texelFetch(uFA, tcU, 0), BU = texelFetch(uFB, tcU, 0), CU = texelFetch(uFC, tcU, 0);
+        float rhoU = AU.r+AU.g+AU.b+AU.a + BU.r+BU.g+BU.b+BU.a + CU.r;
+        float uxU = (AU.g - AU.a + BU.g - BU.b - BU.a + CU.r) / max(rhoU, 1e-6);
+        vec4 AD = texelFetch(uFA, tcD, 0), BD = texelFetch(uFB, tcD, 0), CD = texelFetch(uFC, tcD, 0);
+        float rhoD = AD.r+AD.g+AD.b+AD.a + BD.r+BD.g+BD.b+BD.a + CD.r;
+        float uxD = (AD.g - AD.a + BD.g - BD.b - BD.a + CD.r) / max(rhoD, 1e-6);
+        duxDy = (uxU - uxD) * 0.5;
+      } else if (fU) {
+        vec4 AU = texelFetch(uFA, tcU, 0), BU = texelFetch(uFB, tcU, 0), CU = texelFetch(uFC, tcU, 0);
+        float rhoU = AU.r+AU.g+AU.b+AU.a + BU.r+BU.g+BU.b+BU.a + CU.r;
+        float uxU = (AU.g - AU.a + BU.g - BU.b - BU.a + CU.r) / max(rhoU, 1e-6);
+        duxDy = uxU - ux;
+      } else if (fD) {
+        vec4 AD = texelFetch(uFA, tcD, 0), BD = texelFetch(uFB, tcD, 0), CD = texelFetch(uFC, tcD, 0);
+        float rhoD = AD.r+AD.g+AD.b+AD.a + BD.r+BD.g+BD.b+BD.a + CD.r;
+        float uxD = (AD.g - AD.a + BD.g - BD.b - BD.a + CD.r) / max(rhoD, 1e-6);
+        duxDy = ux - uxD;
+      }
       float vort = duyDx - duxDy;
+
       sumS += spd;  sumS2 += spd*spd;
       sumD += dRho; sumD2 += dRho*dRho;
       sumV += vort; sumV2 += vort*vort;
@@ -717,7 +759,7 @@ const uStream = cacheUniforms(progStream, ['uNoise','uMacro','uRes','uDt','uTime
 const progDiagRead  = link(VS, FS_DIAG_READ);
 const uDiagRead  = cacheUniforms(progDiagRead,  ['uMacro','uGeom']);
 const progProbeRead = link(VS, FS_PROBE_READ);
-const uProbeRead = cacheUniforms(progProbeRead, ['uMacro','uGeom','uCX','uCY','uRadius']);
+const uProbeRead = cacheUniforms(progProbeRead, ['uFA','uFB','uFC','uGeom','uCX','uCY','uRadius']);
 
 /* ---------- Textures & FBOs ---------- */
 function mkTex(w, h, filter) {
@@ -800,6 +842,12 @@ function allocTextures() {
   fboProbeRB = mkFBO([texProbeRB]);
   texDiagRB  = mkTex8(DIAG_W, DIAG_H);
   fboDiagRB  = mkFBO([texDiagRB]);
+  
+  // Verify probe FBO completeness
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbeRB);
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  console.log('Probe FBO status:', status === gl.FRAMEBUFFER_COMPLETE ? 'COMPLETE' : 
+  status.toString(16));
 
   diagPBO = gl.createBuffer();
   gl.bindBuffer(gl.PIXEL_PACK_BUFFER, diagPBO);
@@ -1119,9 +1167,19 @@ function stepOnce() {
   stepN++;
 }
 function computeMacro() {
+  // Clear any stale errors
+  while (gl.getError() !== gl.NO_ERROR) {}
+  
   bindQuad(progMacro);
   gl.viewport(0, 0, NX, NY);
   gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
+  
+  // Check framebuffer completeness
+  const fbStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (fbStatus !== gl.FRAMEBUFFER_COMPLETE) {
+    console.error('fboMacro incomplete:', fbStatus.toString(16));
+  }
+  
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fA[pp]);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, fB[pp]);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, fC[pp]);
@@ -1131,7 +1189,15 @@ function computeMacro() {
   gl.uniform1i(uMacro.uFC, 2);
   gl.uniform1i(uMacro.uGeom, 3);
   gl.uniform2f(uMacro.uRes, NX, NY);
+  
+  // Check for errors BEFORE draw
+  let err = gl.getError();
+  if (err) console.error('Pre-draw error in computeMacro:', err);
+  
   gl.drawArrays(gl.TRIANGLES, 0, 6);
+  
+  err = gl.getError();
+  if (err) console.error('computeMacro draw failed with error:', err);
 }
 
 let vmin = 0, vmax = 1;
@@ -1168,58 +1234,60 @@ function readMacroField() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-// Synchronous CPU probe: reads a small float window from fboMacro directly into a
-// TypedArray (no PBO, no GL-allocated objects — avoids Firefox context-pressure failures)
-// then computes stats in JavaScript.  Throttled to every 6 frames to limit stall frequency.
-function sampleProbeCPU(cx, cy) {
+function sampleProbeGPU(cx, cy) {
   const r = probeRadiusCells();
-  const x0=Math.max(0,cx-r-1), y0=Math.max(0,cy-r-1);
-  const x1=Math.min(NX-1,cx+r+1), y1=Math.min(NY-1,cy+r+1);
-  const bw=x1-x0+1, bh=y1-y0+1, nFloats=bw*bh*4;
-  if (probeSyncBuf.length < nFloats) probeSyncBuf = new Float32Array(nFloats);
-  const buf = probeSyncBuf;
-  // computeMacro() just ran and leaves fboMacro bound; rebind explicitly for clarity.
-  gl.bindFramebuffer(gl.FRAMEBUFFER, fboMacro);
-  gl.readPixels(x0, y0, bw, bh, gl.RGBA, gl.FLOAT, buf);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  const r2lim=r*r+0.5;
-  let sumS=0,sumS2=0,sumD=0,sumD2=0,sumV=0,sumV2=0,sumW=0,sumW2=0,nFluid=0,nWall=0;
-  for (let dy=-r; dy<=r; dy++) {
-    const ay=cy+dy; if (ay<0||ay>=NY) continue;
-    for (let dx=-r; dx<=r; dx++) {
-      if (dx*dx+dy*dy>r2lim) continue;
-      const ax=cx+dx; if (ax<0||ax>=NX) continue;
-      if (geomData[(ay*NX+ax)*4]>0.5) continue;
-      const bi=((ay-y0)*bw+(ax-x0))*4;
-      const ux=buf[bi],uy=buf[bi+1],rho=buf[bi+2];
-      const spd=Math.sqrt(ux*ux+uy*uy), dRho=rho-1.0;
-      const axR=ax+1,axL=ax-1,ayU=ay+1,ayD=ay-1;
-      const fR=axR<NX&&geomData[(ay*NX+axR)*4]<0.5;
-      const fL=axL>=0&&geomData[(ay*NX+axL)*4]<0.5;
-      const fU=ayU<NY&&geomData[(ayU*NX+ax)*4]<0.5;
-      const fD=ayD>=0&&geomData[(ayD*NX+ax)*4]<0.5;
-      let duyDx=0, duxDy=0;
-      if (fR&&fL) duyDx=(buf[((ay-y0)*bw+(axR-x0))*4+1]-buf[((ay-y0)*bw+(axL-x0))*4+1])*0.5;
-      else if(fR) duyDx=buf[((ay-y0)*bw+(axR-x0))*4+1]-uy;
-      else if(fL) duyDx=uy-buf[((ay-y0)*bw+(axL-x0))*4+1];
-      if (fU&&fD) duxDy=(buf[((ayU-y0)*bw+(ax-x0))*4]-buf[((ayD-y0)*bw+(ax-x0))*4])*0.5;
-      else if(fU) duxDy=buf[((ayU-y0)*bw+(ax-x0))*4]-ux;
-      else if(fD) duxDy=ux-buf[((ayD-y0)*bw+(ax-x0))*4];
-      const vort=duyDx-duxDy;
-      sumS+=spd; sumS2+=spd*spd; sumD+=dRho; sumD2+=dRho*dRho;
-      sumV+=vort; sumV2+=vort*vort; nFluid++;
-      const adjWall=(axR<NX&&geomData[(ay*NX+axR)*4]>0.5)||(axL>=0&&geomData[(ay*NX+axL)*4]>0.5)
-                  ||(ayU<NY&&geomData[(ayU*NX+ax)*4]>0.5)||(ayD>=0&&geomData[(ayD*NX+ax)*4]>0.5);
-      if (adjWall) { sumW+=spd; sumW2+=spd*spd; nWall++; }
-    }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboProbeRB);
+  gl.viewport(0, 0, 6, 1);
+
+  // Unbind all samplers
+  for (let i = 0; i < 8; i++) {
+    gl.activeTexture(gl.TEXTURE0 + i);
+    gl.bindTexture(gl.TEXTURE_2D, null);
   }
-  const n=Math.max(nFluid,1), w=Math.max(nWall,1);
-  const mS=sumS/n, mD=sumD/n, mV=sumV/n, mW=sumW/w;
-  return { meanSpd:mS, meanDRho:mD, meanVort:mV, nFluid,
-    stdSpd:Math.sqrt(Math.max(0,sumS2/n-mS*mS)),
-    stdDRho:Math.sqrt(Math.max(0,sumD2/n-mD*mD)),
-    stdVort:Math.sqrt(Math.max(0,sumV2/n-mV*mV)),
-    meanWSpd:mW, stdWSpd:Math.sqrt(Math.max(0,sumW2/w-mW*mW)), hasWall:nWall>0 };
+
+  bindQuad(progProbeRead);
+  gl.uniform1i(uProbeRead.uFA, 0);
+  gl.uniform1i(uProbeRead.uFB, 1);
+  gl.uniform1i(uProbeRead.uFC, 2);
+  gl.uniform1i(uProbeRead.uGeom, 3);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fA[pp]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, fB[pp]);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, fC[pp]);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texGeom);
+  gl.uniform1f(uProbeRead.uCX, cx);
+  gl.uniform1f(uProbeRead.uCY, cy);
+  gl.uniform1f(uProbeRead.uRadius, r);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  // Read back RGBA8 FBO — always safe
+  const probeRBuf = new Uint8Array(6 * 4);
+  gl.readPixels(0, 0, 6, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeRBuf);
+  const allZero = probeRBuf.every(v => v === 0);
+  if (allZero) {
+    // WebGL context is degraded — GL readback returns zeros for everything
+    if (!sampleProbeGPU._warnedOnce) {
+      sampleProbeGPU._warnedOnce = true;
+      console.warn('GPU readback appears broken (all zeros). Try restarting Firefox or   using Chrome.');
+    }
+    return { meanSpd: 0, meanDRho: 0, meanVort: 0, nFluid: 0, stdSpd: 0, stdDRho: 0, stdVort: 0, meanWSpd: 0, stdWSpd: 0, hasWall: false };
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  const U = 0.25, D = 0.15, V = 0.5;
+  return {
+    meanSpd:  (probeRBuf[0] / 255) * U,
+    meanDRho: (probeRBuf[1] / 255) * 2 * D - D,
+    meanVort: (probeRBuf[2] / 255) * 2 * V - V,
+    nFluid:   Math.round(probeRBuf[3] / 255 * 250),
+    stdSpd:   (probeRBuf[4] / 255) * U,
+    stdDRho:  (probeRBuf[5] / 255) * D,
+    stdVort:  (probeRBuf[6] / 255) * V,
+    meanWSpd: (probeRBuf[8] / 255) * U,
+    stdWSpd:  (probeRBuf[9] / 255) * U,
+    hasWall:  probeRBuf[10] > 127,
+  };
 }
 
 function updateProbeStats(nx, ny) {
@@ -1241,6 +1309,11 @@ function refreshProbeDisplay(cx, cy, s) {
   const modeEl = $('probeModeLabel');
   modeEl.textContent = isWall ? '● WSS probe' : '● Fluid probe';
   modeEl.className   = isWall ? 'probe-mode-lbl wall' : 'probe-mode-lbl';
+  
+  if (s.nFluid === 0) {
+  $('probeModeLabel').textContent = '⚠ GPU degraded — restart Firefox';
+  $('probeModeLabel').className = 'probe-mode-lbl wall';
+	}
 }
 
 // Decode diagRBuf into percentile stats and KE; update colormap scale.
@@ -1701,6 +1774,13 @@ function frame(time) {
   }
   computeMacro();
 
+  // CRITICAL: Unbind texMacro from ALL sampler units before calling readPixels on fboMacro.
+  // WebGL 2.0 forbids reading from a texture that is simultaneously bound as a sampler.
+  for (let i = 0; i < 8; i++) {
+    gl.activeTexture(gl.TEXTURE0 + i);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+  
   // Probe: collect last frame's async PBO result, update display, kick new readback.
   // Runs right after computeMacro so fboMacro is freshly written and not yet rebound.
   if (probe.enabled && probe.clicked) {
@@ -1709,9 +1789,9 @@ function frame(time) {
     if (cx >= 0 && cx < NX && cy >= 0 && cy < NY) {
       // Throttle readback to every 6 frames to limit synchronous GPU stall frequency.
       if (++probeFrameTick >= 6) {
-        probeFrameTick = 0;
-        probeLastStats = sampleProbeCPU(cx, cy);
-      }
+		  probeFrameTick = 0;
+		  probeLastStats = sampleProbeGPU(cx, cy);
+		}
       if (probeLastStats) refreshProbeDisplay(cx, cy, probeLastStats);
     }
   }
