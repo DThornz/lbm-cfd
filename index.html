@@ -12,7 +12,7 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body class="light-mode size-sm">
-<nav class="site-nav">
+<div class="site-nav">
   <a class="site-nav-logo" href="https://dthornz.github.io/website-cv-tools/">A.Mirza <span>/</span> site</a>
   <a class="site-nav-link" href="https://dthornz.github.io/website-cv-tools/">Home</a>
   <a class="site-nav-link" href="https://dthornz.github.io/website-cv-tools/AsadMirza_CV.html">CV</a>
@@ -23,13 +23,13 @@
       <a class="nav-dropdown-item" href="https://dthornz.github.io/maxwell-boltzmann/">⚛ MB Gas Simulator</a>
       <a class="nav-dropdown-item" style="color:var(--teal);font-weight:600" href="#">🌊 LBM CFD Simulator</a>
       <a class="nav-dropdown-item" href="https://dthornz.github.io/eng-fea-cfd-calc/">⚙ Eng / FEA / CFD Calc</a>
-      <a class="nav-dropdown-item" href="https://dthornz.github.io/website-cv-tools/dissertation.html">📋 PhD Dissertation</a>
       <a class="nav-dropdown-item" href="https://dthornz.github.io/academic-ref-validator/">📑 Reference Validator</a>
     <a class="nav-dropdown-item" href="https://dthornz.github.io/1D-Energy-Transport-Sim/">🌡 1D Energy Transport Sim</a>
     <a class="nav-dropdown-item" href="https://dthornz.github.io/curve-fitting-studio/">📈 Curve Fitting Studio</a>
+    <a class="nav-dropdown-item" href="https://dthornz.github.io/website-cv-tools/dissertation.html">📋 PhD Dissertation</a>
     </div>
   </div>
-</nav>
+</div>
 
 <div class="page-wrap">
 <header class="hero">
@@ -647,5 +647,12 @@
 </div>
 
 <script src="script.js"></script>
+
+<!-- Copyright footer -->
+<footer style="text-align:center;padding:20px 24px;font-family:'DM Mono',monospace;font-size:.72em;color:var(--dim);border-top:1px solid var(--border);margin-top:auto">
+  © <span id="cur-year">2026</span> Asad Mirza, Ph.D. · Research Assistant Professor · FIU Biomedical Engineering ·
+  <a href="https://github.com/DThornz/website-cv-tools" target="_blank" style="color:var(--dim)">GitHub</a>
+</footer>
+<script>document.getElementById('cur-year').textContent=new Date().getFullYear();</script>
 </body>
 </html>
